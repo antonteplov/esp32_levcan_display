@@ -203,12 +203,16 @@ bool reqEntryCmd(uint8_t target, uint16_t dirIndex, uint16_t entryIndex, uint16_
                     (uint8_t)(entryIndex & 0xFF), (uint8_t)(entryIndex >> 8) };
   return sendFrame(packId(h), pl, 6);
 }
-bool reqEntry         (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_DATA_NAME); }
-bool reqEntryVariable (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_VARIABLE);  }
+bool reqEntry           (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_DATA_NAME);  }
+bool reqEntryVariable   (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_VARIABLE);   }
+bool reqEntryDescriptor (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_DESCRIPTOR); }
 bool reqSysName(uint8_t target, uint16_t msgId) {
   // RTR-запрос (Request flag) на системное msgId. Если target=BROADCAST — отвечают все.
+  // ВАЖНО: для нового запроса нужны RTS_CTS=0, EoM=0, Parity=0 (см. levcan.c строка 951:
+  //   if (rxBuffered.header.Request) { if (RTS_CTS==0 && EoM==0) /*new request*/ ...
+  // иначе наш запрос трактуется как CTS/EoM-ACK для несуществующего TX-объекта).
   LcHeader h{}; h.source=MY_ADDR; h.target=target; h.msgId=msgId;
-  h.eom=1; h.parity=1; h.rts=1; h.prio=0;
+  h.eom=0; h.parity=0; h.rts=0; h.prio=0;
   return sendFrame(packId(h), nullptr, 0, /*rtr=*/true);
 }
 bool reqDeviceName(uint8_t target) { return reqSysName(target, MSG_DEVICE_NAME); }
@@ -534,6 +538,10 @@ bool entryValueReady() {
   EntryInfo& e = curDir.entries[pending.entryIndex];
   return e.hasValue;
 }
+bool entryDescReady() {
+  EntryInfo& e = curDir.entries[pending.entryIndex];
+  return e.hasDesc;
+}
 
 bool loadDir(uint8_t target, uint16_t dirIndex) {
   Serial.printf("[loadDir target=%u dir=%u]\n", target, dirIndex);
@@ -566,8 +574,23 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
       pending.kind = WK_NONE; delay(20); continue;
     }
 
-    // Шаг Б: Value (если имеет смысл)
     EntryInfo& e = curDir.entries[i];
+
+    // Шаг А': Descriptor (нужен только для Decimal32 — оттуда берём кол-во знаков после запятой Decimals).
+    bool needDesc = (e.type == LCP_Decimal32);
+    if (needDesc) {
+      delay(20);
+      bool dok = false;
+      for (int retry = 0; retry < 3 && !dok; retry++) {
+        if (retry > 0) resetAllChannels();
+        reqEntryDescriptor(target, dirIndex, i);
+        dok = waitFor(1500, entryDescReady);
+        if (!dok) Serial.printf("    retry entry %u desc\n", i);
+      }
+      if (!dok) Serial.printf("  entry %u: skip desc after retries\n", i);
+    }
+
+    // Шаг Б: Value (если имеет смысл)
     bool needValue = (e.type != LCP_Folder) && (e.type != LCP_Label)
                   && ((e.mode & 0x02) == 0)  // не WriteOnly
                   && (e.varSize > 0);
@@ -701,10 +724,29 @@ void formatValue(const EntryInfo& e, char* out, size_t outSize) {
       snprintf(out, outSize, "%lu", (unsigned long)v); break;
     }
     case LCP_Decimal32: {
-      // Decimal32: 4 байта integer + descriptor (decimals) известен в descSize/desc[]
-      // на упрощение: трактуем как int16 со знаком и подразумеваем 1 знак (как у T-sensors)
-      int16_t v = (int16_t)(e.value[0] | (e.value[1]<<8));
-      snprintf(out, outSize, "%d.%d", v/10, abs(v%10));
+      // Variable: int8/int16/int32 со знаком (судим по e.varSize).
+      // Descriptor: LCP_Decimal32_t = int32 Min, int32 Max, int32 Step, uint8 Decimals (всего 13 байт).
+      // Decimals = кол-во знаков после запятой, делитель = 10^Decimals.
+      int32_t v = 0;
+      if      (e.valueLen >= 4) { v = (int32_t)((uint32_t)e.value[0] | ((uint32_t)e.value[1]<<8) |
+                                                 ((uint32_t)e.value[2]<<16) | ((uint32_t)e.value[3]<<24)); }
+      else if (e.valueLen >= 2) { int16_t s = (int16_t)((uint16_t)e.value[0] | ((uint16_t)e.value[1]<<8)); v = s; }
+      else if (e.valueLen >= 1) { v = (int8_t)e.value[0]; }
+      uint8_t decimals = 0;
+      if (e.hasDesc && e.descLen >= 13) decimals = e.desc[12];
+      if (decimals == 0) {
+        snprintf(out, outSize, "%ld", (long)v);
+      } else {
+        int32_t div = 1; for (uint8_t k = 0; k < decimals; k++) div *= 10;
+        int32_t whole = v / div;
+        int32_t frac  = v % div; if (frac < 0) frac = -frac;
+        // знаков после точки = decimals (с ведущими нулями), ограничиваем до 6
+        if (decimals > 6) decimals = 6;
+        char fmt[16]; snprintf(fmt, sizeof(fmt), "%%ld.%%0%uld", (unsigned)decimals);
+        // знак "−" лежит в whole когда он не ноль, иначе добавим вручную для -0.х
+        if (v < 0 && whole == 0) snprintf(out, outSize, "-0.%0*ld", (int)decimals, (long)frac);
+        else                     snprintf(out, outSize, fmt, (long)whole, (long)frac);
+      }
       break;
     }
     case LCP_Float: {
@@ -827,12 +869,9 @@ void handleSelect() {
   if (cursor >= curDir.entrySize) return;
   EntryInfo& e = curDir.entries[cursor];
   if (e.type == LCP_Folder) {
-    drawLoading("descriptor");
-    uint16_t childDir = 0xFFFF;
-    if (!fetchFolderDirIndex(targetAddr, curDirIndex, cursor, &childDir)) {
-      Serial.println("  failed to fetch child dir");
-      return;
-    }
+    // Для Folder дочерний dirIndex уже лежит в entry->VarSize и приходит в lc_entry_data_t
+    // (см. levcan_paramserver.c:264 «dindex = entry->VarSize»). Никакой descriptor у folder нет.
+    uint16_t childDir = e.varSize;
     Serial.printf("  → folder %u\n", childDir);
     enterFolder(childDir);
   } else {
