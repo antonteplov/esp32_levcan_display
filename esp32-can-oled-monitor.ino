@@ -206,6 +206,7 @@ bool reqEntryCmd(uint8_t target, uint16_t dirIndex, uint16_t entryIndex, uint16_
 bool reqEntry           (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_DATA_NAME);  }
 bool reqEntryVariable   (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_VARIABLE);   }
 bool reqEntryDescriptor (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_DESCRIPTOR); }
+bool reqEntryText       (uint8_t target, uint16_t dir, uint16_t e) { return reqEntryCmd(target, dir, e, LCP_REQ_TEXT);       }
 bool reqSysName(uint8_t target, uint16_t msgId) {
   // RTR-запрос (Request flag) на системное msgId. Если target=BROADCAST — отвечают все.
   // ВАЖНО: для нового запроса нужны RTS_CTS=0, EoM=0, Parity=0 (см. levcan.c строка 951:
@@ -542,6 +543,10 @@ bool entryDescReady() {
   EntryInfo& e = curDir.entries[pending.entryIndex];
   return e.hasDesc;
 }
+bool entryTextReady() {
+  EntryInfo& e = curDir.entries[pending.entryIndex];
+  return e.hasText;
+}
 
 bool loadDir(uint8_t target, uint16_t dirIndex) {
   Serial.printf("[loadDir target=%u dir=%u]\n", target, dirIndex);
@@ -576,8 +581,10 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
 
     EntryInfo& e = curDir.entries[i];
 
-    // Шаг А': Descriptor (нужен только для Decimal32 — оттуда берём кол-во знаков после запятой Decimals).
-    bool needDesc = (e.type == LCP_Decimal32);
+    // Шаг А': Descriptor.
+    //   Decimal32 — забираем Decimals (1 байт по смещению 12).
+    //   Enum     — забираем Min (uint32, смещение 0 в LCP_Enum_t).
+    bool needDesc = (e.type == LCP_Decimal32) || (e.type == LCP_Enum);
     if (needDesc) {
       delay(20);
       bool dok = false;
@@ -588,6 +595,21 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
         if (!dok) Serial.printf("    retry entry %u desc\n", i);
       }
       if (!dok) Serial.printf("  entry %u: skip desc after retries\n", i);
+    }
+
+    // Шаг А'': Text — для Enum/Bool это список значений через '\n'.
+    // Запрашиваем только если сервер сообщил textSize > 0 (иначе Bool берёт встроенный 'off\nON').
+    bool needText = (e.type == LCP_Enum || e.type == LCP_Bool) && (e.textSize > 0);
+    if (needText) {
+      delay(20);
+      bool tok = false;
+      for (int retry = 0; retry < 3 && !tok; retry++) {
+        if (retry > 0) resetAllChannels();
+        reqEntryText(target, dirIndex, i);
+        tok = waitFor(1500, entryTextReady);
+        if (!tok) Serial.printf("    retry entry %u text\n", i);
+      }
+      if (!tok) Serial.printf("  entry %u: skip text after retries\n", i);
     }
 
     // Шаг Б: Value (если имеет смысл)
@@ -711,10 +733,34 @@ void drawLoading(const char* what) {
 }
 
 // Форматирование значения параметра в строку
+// Скопировать в out подстроку с индексом idx из src, где разделитель '\n'.
+// Возвращает true если подстрока найдена.
+static bool pickEnumLabel(const char* src, uint32_t idx, char* out, size_t outSize) {
+  if (!src || !src[0]) return false;
+  const char* p = src;
+  for (uint32_t k = 0; k < idx; k++) {
+    const char* nl = strchr(p, '\n');
+    if (!nl) return false;
+    p = nl + 1;
+  }
+  const char* end = strchr(p, '\n');
+  size_t len = end ? (size_t)(end - p) : strlen(p);
+  if (len >= outSize) len = outSize - 1;
+  memcpy(out, p, len);
+  out[len] = 0;
+  return true;
+}
+
 void formatValue(const EntryInfo& e, char* out, size_t outSize) {
   if (!e.hasValue) { out[0] = '?'; out[1] = 0; return; }
   switch (e.type) {
-    case LCP_Bool: snprintf(out, outSize, "%s", e.value[0] ? "ON" : "off"); break;
+    case LCP_Bool: {
+      // По протоколу: в TextData две строки через '\n' (первая — false, вторая — true).
+      uint32_t idx = e.value[0] ? 1 : 0;
+      if (e.hasText && pickEnumLabel(e.text, idx, out, outSize)) break;
+      snprintf(out, outSize, "%s", idx ? "ON" : "off");
+      break;
+    }
     case LCP_Int32: {
       int32_t v = (int32_t)(e.value[0] | (e.value[1]<<8) | (e.value[2]<<16) | (e.value[3]<<24));
       snprintf(out, outSize, "%ld", (long)v); break;
@@ -753,7 +799,21 @@ void formatValue(const EntryInfo& e, char* out, size_t outSize) {
       float f; memcpy(&f, e.value, 4);
       snprintf(out, outSize, "%.2f", f); break;
     }
-    case LCP_Enum: snprintf(out, outSize, "%u", e.value[0]); break;
+    case LCP_Enum: {
+      // Целое без знака по размеру varSize, индекс = (val - Min). Min лежит в дескрипторе (offset 0, uint32 LE).
+      uint32_t v = 0;
+      if      (e.valueLen >= 4) v = (uint32_t)e.value[0] | ((uint32_t)e.value[1]<<8) | ((uint32_t)e.value[2]<<16) | ((uint32_t)e.value[3]<<24);
+      else if (e.valueLen >= 2) v = (uint32_t)e.value[0] | ((uint32_t)e.value[1]<<8);
+      else if (e.valueLen >= 1) v = e.value[0];
+      uint32_t minv = 0;
+      if (e.hasDesc && e.descLen >= 4) {
+        minv = (uint32_t)e.desc[0] | ((uint32_t)e.desc[1]<<8) | ((uint32_t)e.desc[2]<<16) | ((uint32_t)e.desc[3]<<24);
+      }
+      uint32_t idx = (v >= minv) ? (v - minv) : 0;
+      if (e.hasText && pickEnumLabel(e.text, idx, out, outSize)) break;
+      snprintf(out, outSize, "%lu", (unsigned long)v);
+      break;
+    }
     default:
       out[0] = 0;
       for (uint8_t k = 0; k < e.valueLen && k < 4; k++) {
