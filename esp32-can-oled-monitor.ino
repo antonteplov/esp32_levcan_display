@@ -64,6 +64,7 @@ static const uint16_t LCP_REQ_VARIABLE       = 0x10;
 static const uint16_t LCP_REQ_DATA_NAME      = 0x03;  // Data + Name
 static const uint16_t LCP_REQ_FULL_ENTRY     = 0x1F;
 static const uint16_t LCP_REQ_DIRECTORY_INFO = 0x20;
+static const uint16_t LCP_REQ_VALUE_SET      = 0x40;  // запись значения
 
 enum LCP_Type {
   LCP_Folder=0, LCP_Label, LCP_Bool, LCP_Enum, LCP_Bitfield32,
@@ -81,7 +82,7 @@ enum LCP_Type {
 #define MAX_ENTRIES_DIR  20
 #define NAME_BUF         48
 #define TEXT_BUF         96
-#define DESC_BUF         32
+#define DESC_BUF         48  // Decimal32_t=13, Int64_t/Uint64_t=24, запас на будущее
 #define ASM_BUF          128
 #define DEPTH_STACK      8
 
@@ -170,6 +171,20 @@ static LcHeader unpackId(uint32_t id) {
   return h;
 }
 
+// ====== Ожидание CTS/ACK от сервера при multi-frame TX ======
+// (определено заранее, до sendTcpToServer, который её использует)
+struct TxWaitState {
+  bool     active;
+  uint8_t  src;
+  uint16_t msgId;
+  bool     gotCts;       // пришло RTR с rts=1, eom=0
+  uint8_t  ctsParity;
+  bool     gotFinalAck;  // пришло RTR с rts=0, eom=1
+} txWait;
+
+// ====== Forward declarations (используются в drawBrowse до своего определения) ======
+bool isEditable(const EntryInfo& e);
+
 // ====== TWAI ======
 bool initCAN() {
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL);
@@ -220,6 +235,104 @@ bool reqDeviceName(uint8_t target) { return reqSysName(target, MSG_DEVICE_NAME);
 bool reqNodeName  (uint8_t target) { return reqSysName(target, MSG_NODE_NAME);   }
 bool broadcastDeviceNameQuery() { return reqDeviceName(BROADCAST); }
 bool broadcastNodeNameQuery()   { return reqNodeName(BROADCAST);   }
+
+// Отправка пакета на 0x399 (ParametersRequest). Длина любая, multi-frame TCP если >8.
+// Ответы CTS/ACK приходят RTR-кадрами от target на том же msgId.
+bool sendTcpToServer(uint8_t target, uint16_t msgId, const uint8_t* data, uint16_t len) {
+  // Подготовим слот ожидания CTS/ACK
+  txWait = { true, target, msgId, false, 0, false };
+
+  if (len <= 8) {
+    // single-frame: rts=1, eom=1, parity=1
+    LcHeader h{}; h.source=MY_ADDR; h.target=target; h.msgId=msgId;
+    h.rts=1; h.eom=1; h.parity=1; h.prio=0;
+    if (!sendFrame(packId(h), data, (uint8_t)len, false)) { txWait.active=false; return false; }
+    // ждём final ACK (RTR rts=0 eom=1)
+    uint32_t t0 = millis();
+    while (millis() - t0 < 800 && !txWait.gotFinalAck) {
+      twai_message_t m; while (twai_receive(&m, 0) == ESP_OK) handleFrame(m);
+      delay(2);
+    }
+    bool ok = txWait.gotFinalAck;
+    txWait.active = false;
+    return ok;
+  }
+
+  // multi-frame TCP. Протокол:
+  //   frame0: rts=1, eom=0, parity=1, data[0..7]
+  //   <- CTS RTR rts=1, eom=0, parity=ожидаемый паритет след.фрейма
+  //   frameN: rts=0, eom=(последний?1:0), parity=ожидаемый
+  //   <- final ACK RTR rts=0, eom=1
+  uint16_t pos = 0;
+  uint8_t  parity = 1;  // первый фрейм
+  // frame 0
+  {
+    uint16_t take = 8;
+    LcHeader h{}; h.source=MY_ADDR; h.target=target; h.msgId=msgId;
+    h.rts=1; h.eom=0; h.parity=parity; h.prio=0;
+    if (!sendFrame(packId(h), data + pos, (uint8_t)take, false)) { txWait.active=false; return false; }
+    pos += take;
+  }
+  // ждём CTS
+  {
+    uint32_t t0 = millis();
+    while (millis() - t0 < 800 && !txWait.gotCts) {
+      twai_message_t m; while (twai_receive(&m, 0) == ESP_OK) handleFrame(m);
+      delay(2);
+    }
+    if (!txWait.gotCts) { txWait.active=false; Serial.println("  TX: CTS timeout"); return false; }
+  }
+  // оставшиеся фреймы
+  while (pos < len) {
+    uint16_t take = (len - pos > 8) ? 8 : (len - pos);
+    bool last = (pos + take >= len);
+    parity = (~(((pos + 7) / 8))) & 1;  // паритет для текущего position
+    LcHeader h{}; h.source=MY_ADDR; h.target=target; h.msgId=msgId;
+    h.rts=0; h.eom=last?1:0; h.parity=parity; h.prio=0;
+    if (!sendFrame(packId(h), data + pos, (uint8_t)take, false)) { txWait.active=false; return false; }
+    pos += take;
+    if (!last) {
+      // ждём следующий CTS перед очередным блоком (сервер обычно разрешает сразу после первого CTS).
+      // На практике для payload <=16 байт этот блок не выполняется.
+      txWait.gotCts = false;
+      uint32_t t0 = millis();
+      while (millis() - t0 < 400 && !txWait.gotCts) {
+        twai_message_t m; while (twai_receive(&m, 0) == ESP_OK) handleFrame(m);
+        delay(2);
+      }
+      if (!txWait.gotCts) { txWait.active=false; Serial.println("  TX: mid CTS timeout"); return false; }
+    }
+  }
+  // ждём final ACK
+  {
+    uint32_t t0 = millis();
+    while (millis() - t0 < 800 && !txWait.gotFinalAck) {
+      twai_message_t m; while (twai_receive(&m, 0) == ESP_OK) handleFrame(m);
+      delay(2);
+    }
+    bool ok = txWait.gotFinalAck;
+    txWait.active = false;
+    if (!ok) Serial.println("  TX: final ACK timeout");
+    return ok;
+  }
+}
+
+// Собирает lc_value_set_t и шлёт его на сервер. Ответ (1 байт ErrorCode на 0x39A) ждём
+// в вызывающем коде через setResult.received.
+bool sendValueSet(uint8_t target, uint16_t dirIndex, uint16_t entryIndex,
+                  const uint8_t* value, uint16_t valueSize) {
+  uint16_t total = 6 + valueSize;
+  if (total > 64) return false;
+  uint8_t buf[64];
+  buf[0] = (uint8_t)(LCP_REQ_VALUE_SET & 0xFF);
+  buf[1] = (uint8_t)(LCP_REQ_VALUE_SET >> 8);
+  buf[2] = (uint8_t)(dirIndex & 0xFF);
+  buf[3] = (uint8_t)(dirIndex >> 8);
+  buf[4] = (uint8_t)(entryIndex & 0xFF);
+  buf[5] = (uint8_t)(entryIndex >> 8);
+  for (uint16_t i = 0; i < valueSize; i++) buf[6+i] = value[i];
+  return sendTcpToServer(target, MSG_PARAM_REQUEST, buf, total);
+}
 
 // ====== Имена типов ======
 const char* typeName(uint8_t t) {
@@ -297,7 +410,7 @@ bool sendCTS(uint8_t target, uint16_t msgId, uint8_t parity, uint8_t rts, uint8_
 }
 
 // ====== Состояние ожидания ======
-enum WaitKind { WK_NONE, WK_DIR, WK_ENTRY, WK_VALUE };
+enum WaitKind { WK_NONE, WK_DIR, WK_ENTRY, WK_VALUE, WK_SET };
 struct {
   WaitKind kind;
   uint8_t  target;
@@ -305,6 +418,12 @@ struct {
   uint16_t entryIndex;
   uint32_t startMs;
 } pending;
+
+// ====== Результат ValueSet (приходит в 0x39A как 1 байт ErrorCode) ======
+struct {
+  bool     received;
+  uint8_t  errorCode;
+} setResult;
 
 // ====== Парсинг ======
 void onDeviceName(uint8_t srcAddr, const uint8_t* d, uint16_t len) {
@@ -419,6 +538,14 @@ void dispatchChannel(int idx) {
     }
   } else if (pending.kind == WK_VALUE) {
     if (msgId == MSG_PARAM_VALUE) onValue(pending.entryIndex, c.buf, c.pos);
+  } else if (pending.kind == WK_SET) {
+    // Ответ на ValueSet приходит в 0x39A (MSG_PARAM_DATA = LC_SYS_ParametersData)
+    // и содержит 1 байт ErrorCode (lc_request_error_t)
+    if (msgId == MSG_PARAM_DATA && c.pos >= 1) {
+      setResult.errorCode = c.buf[0];
+      setResult.received  = true;
+      Serial.printf("  ValueSet response: errorCode=%u\n", c.buf[0]);
+    }
   }
   resetChannel(idx);
 }
@@ -443,7 +570,16 @@ void handleFrame(const twai_message_t& m) {
     return;
   }
 
-  if (m.rtr) return;  // дальше работаем только с data-кадрами
+  // RTR-кадры: это CTS/ACK от сервера. Если мы сейчас ведём multi-frame TX, пробуем поймать.
+  if (m.rtr) {
+    if (txWait.active && h.source == txWait.src && h.msgId == txWait.msgId) {
+      if (h.rts == 1 && h.eom == 0) { txWait.gotCts = true; txWait.ctsParity = h.parity; }
+      else if (h.rts == 0 && h.eom == 1) { txWait.gotFinalAck = true; }
+      if (VERBOSE_RX) Serial.printf("    RX RTR src=%u msg=0x%X rts=%u eom=%u par=%u\n",
+                                    h.source, h.msgId, h.rts, h.eom, h.parity);
+    }
+    return;
+  }
 
   if (VERBOSE_RX) {
     Serial.printf("    RX 0x%X src=%u msg=0x%X eom=%u par=%u rts=%u dlc=%u\n",
@@ -584,7 +720,11 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
     // Шаг А': Descriptor.
     //   Decimal32 — забираем Decimals (1 байт по смещению 12).
     //   Enum     — забираем Min (uint32, смещение 0 в LCP_Enum_t).
-    bool needDesc = (e.type == LCP_Decimal32) || (e.type == LCP_Enum);
+    //   Int/Uint/Int64/Uint64 — забираем {Min, Max, Step} для редактора.
+    //   Bool дескриптора не имеет (DescSize=0 в pbool macro).
+    bool needDesc = (e.type == LCP_Decimal32) || (e.type == LCP_Enum)
+                 || (e.type == LCP_Int32)     || (e.type == LCP_Uint32)
+                 || (e.type == LCP_Int64)     || (e.type == LCP_Uint64);
     if (needDesc) {
       delay(20);
       bool dok = false;
@@ -670,8 +810,28 @@ bool pollButton(int i) {
 }
 
 // ====== UI ======
-enum AppState { S_DISCOVER, S_DEVICES, S_LOAD_DIR, S_BROWSE };
+enum AppState { S_DISCOVER, S_DEVICES, S_LOAD_DIR, S_BROWSE, S_EDIT, S_EDIT_APPLY };
 AppState appState = S_DISCOVER;
+
+// ====== Состояние редактора значения ======
+#define EDIT_MAX_OPTIONS 256
+struct {
+  uint16_t entryIdx;       // какой entry редактируем (в curDir)
+  uint8_t  type;           // LCP_Type
+  uint16_t varSize;        // 1/2/4 байт
+  bool     isSigned;       // для численных типов
+  // диапазон и шаг (signed-объём покрывает и unsigned до 2^31-1)
+  int32_t  vmin, vmax, vstep;
+  uint16_t count;          // сколько вариантов (1..EDIT_MAX_OPTIONS)
+  uint16_t cursor;
+  uint16_t scrollTop;
+  // для Decimal32: Decimals
+  uint8_t  decimals;
+  // каждый вариант выражается через (vmin + i*vstep) — это лениво вычисляемый список, памяти не храним.
+  // Опция “Отмена” обрабатывается кнопкой Back, отдельный пункт не нужен.
+  // format-строка из e.text (для численных), или список лейблов (Enum/Bool) — берём
+  // прямо из curDir.entries[entryIdx].text по необходимости.
+} editor;
 uint32_t lastBroadcastMs = 0;
 uint32_t lastLiveUpdMs   = 0;
 uint32_t discoverStartMs = 0;
@@ -865,8 +1025,16 @@ void drawBrowse() {
   }
   display.setTextColor(SSD1306_WHITE);
   display.fillRect(0, SCREEN_HEIGHT-9, SCREEN_WIDTH, 9, SSD1306_BLACK);
-  char foot[24]; snprintf(foot, sizeof(foot), "%u/%u %s", cursor+1, curDir.entrySize,
-                          dirStackPos > 0 ? "B=back" : "B=devs");
+  // Подсказка по кнопке Select зависит от типа текущего пункта:
+  //   Folder → S=open, редактируемый → S=edit, иначе (просто read-only лист) — без подсказки.
+  const char* selHint = "";
+  if (cursor < curDir.entrySize) {
+    const EntryInfo& ec = curDir.entries[cursor];
+    if (ec.type == LCP_Folder)   selHint = " S=open";
+    else if (isEditable(ec))     selHint = " S=edit";
+  }
+  char foot[32]; snprintf(foot, sizeof(foot), "%u/%u %s%s", cursor+1, curDir.entrySize,
+                          dirStackPos > 0 ? "B=back" : "B=devs", selHint);
   drawFooter(foot);
   display.display();
 }
@@ -925,6 +1093,211 @@ bool fetchFolderDirIndex(uint8_t target, uint16_t dirIndex, uint16_t entryIdx, u
   return true;
 }
 
+// Можно ли редактировать entry?
+bool isEditable(const EntryInfo& e) {
+  if (e.type == LCP_Folder || e.type == LCP_Label || e.type == LCP_String) return false;
+  if (e.type == LCP_Float || e.type == LCP_Double || e.type == LCP_Bitfield32) return false; // пока не поддерживаем
+  if (e.mode & LCP_MODE_RO) return false;        // ReadOnly
+  if (e.mode & LCP_MODE_WO) return false;        // пока не поддерживаем WriteOnly
+  if (e.varSize == 0) return false;
+  return true;
+}
+
+// Разобрать {Min, Max, Step} из дескриптора. Для Decimal32 также берём Decimals.
+// Для Bool/Enum выставляем min/max вручную.
+bool prepareEditor(uint16_t entryIdx) {
+  EntryInfo& e = curDir.entries[entryIdx];
+  editor.entryIdx = entryIdx;
+  editor.type = e.type;
+  editor.varSize = e.varSize;
+  editor.cursor = 0;
+  editor.scrollTop = 0;
+  editor.decimals = 0;
+  editor.isSigned = false;
+
+  auto rd_i32 = [&](uint16_t off, int32_t* out) -> bool {
+    if (e.descLen < off + 4) return false;
+    *out = (int32_t)((uint32_t)e.desc[off] | ((uint32_t)e.desc[off+1] << 8)
+                   | ((uint32_t)e.desc[off+2] << 16) | ((uint32_t)e.desc[off+3] << 24));
+    return true;
+  };
+
+  switch (e.type) {
+    case LCP_Bool:
+      editor.vmin = 0; editor.vmax = 1; editor.vstep = 1; editor.count = 2; break;
+    case LCP_Enum: {
+      // в дескрипторе LCP_Enum_t = {Min:u32, Size:u32}. Size = кол-во вариантов.
+      int32_t mn=0, sz=0;
+      if (!rd_i32(0, &mn) || !rd_i32(4, &sz)) return false;
+      if (sz <= 0) sz = 1;
+      if (sz > EDIT_MAX_OPTIONS) sz = EDIT_MAX_OPTIONS;
+      editor.vmin = mn; editor.vmax = mn + sz - 1; editor.vstep = 1; editor.count = (uint16_t)sz;
+      break;
+    }
+    case LCP_Int32: case LCP_Int64: {
+      editor.isSigned = true;
+      int32_t mn,mx,st;
+      if (!rd_i32(0,&mn) || !rd_i32(4,&mx) || !rd_i32(8,&st)) return false;
+      if (st <= 0) st = 1;
+      editor.vmin = mn; editor.vmax = mx; editor.vstep = st;
+      int64_t cnt = ((int64_t)mx - (int64_t)mn) / st + 1;
+      if (cnt < 1) cnt = 1; if (cnt > EDIT_MAX_OPTIONS) cnt = EDIT_MAX_OPTIONS;
+      editor.count = (uint16_t)cnt;
+      break;
+    }
+    case LCP_Uint32: case LCP_Uint64: {
+      int32_t mn,mx,st;
+      if (!rd_i32(0,&mn) || !rd_i32(4,&mx) || !rd_i32(8,&st)) return false;
+      if (st <= 0) st = 1;
+      editor.vmin = mn; editor.vmax = mx; editor.vstep = st;
+      int64_t cnt = ((int64_t)(uint32_t)mx - (int64_t)(uint32_t)mn) / st + 1;
+      if (cnt < 1) cnt = 1; if (cnt > EDIT_MAX_OPTIONS) cnt = EDIT_MAX_OPTIONS;
+      editor.count = (uint16_t)cnt;
+      break;
+    }
+    case LCP_Decimal32: {
+      editor.isSigned = true;
+      int32_t mn,mx,st;
+      if (!rd_i32(0,&mn) || !rd_i32(4,&mx) || !rd_i32(8,&st)) return false;
+      if (st <= 0) st = 1;
+      editor.vmin = mn; editor.vmax = mx; editor.vstep = st;
+      if (e.descLen >= 13) editor.decimals = e.desc[12];
+      int64_t cnt = ((int64_t)mx - (int64_t)mn) / st + 1;
+      if (cnt < 1) cnt = 1; if (cnt > EDIT_MAX_OPTIONS) cnt = EDIT_MAX_OPTIONS;
+      editor.count = (uint16_t)cnt;
+      break;
+    }
+    default:
+      return false;
+  }
+
+  // Подвинем курсор на текущее значение, если оно известно.
+  if (e.hasValue) {
+    int32_t cur = 0;
+    if      (e.valueLen >= 4) cur = (int32_t)((uint32_t)e.value[0] | ((uint32_t)e.value[1]<<8) | ((uint32_t)e.value[2]<<16) | ((uint32_t)e.value[3]<<24));
+    else if (e.valueLen >= 2) cur = editor.isSigned ? (int32_t)(int16_t)((uint16_t)e.value[0] | ((uint16_t)e.value[1]<<8))
+                                                    : (int32_t)((uint16_t)e.value[0] | ((uint16_t)e.value[1]<<8));
+    else if (e.valueLen >= 1) cur = editor.isSigned ? (int32_t)(int8_t)e.value[0] : (int32_t)e.value[0];
+    if (editor.vstep > 0 && cur >= editor.vmin && cur <= editor.vmax) {
+      uint32_t idx = (uint32_t)((cur - editor.vmin) / editor.vstep);
+      if (idx < editor.count) editor.cursor = (uint16_t)idx;
+    }
+  }
+  return true;
+}
+
+// Сформировать в out текст i-го варианта
+void formatEditorOption(uint16_t i, char* out, size_t outSize) {
+  EntryInfo& e = curDir.entries[editor.entryIdx];
+  int32_t v = editor.vmin + (int32_t)i * editor.vstep;
+  switch (editor.type) {
+    case LCP_Bool: {
+      uint32_t idx = v ? 1 : 0;
+      if (e.hasText && pickEnumLabel(e.text, idx, out, outSize)) return;
+      snprintf(out, outSize, "%s", idx ? "ON" : "off");
+      return;
+    }
+    case LCP_Enum: {
+      uint32_t idx = (uint32_t)((v - editor.vmin) / editor.vstep);
+      if (e.hasText && pickEnumLabel(e.text, idx, out, outSize)) return;
+      snprintf(out, outSize, "%ld", (long)v); return;
+    }
+    case LCP_Decimal32: {
+      uint8_t d = editor.decimals; if (d > 6) d = 6;
+      if (d == 0) { snprintf(out, outSize, "%ld", (long)v); return; }
+      int32_t div = 1; for (uint8_t k=0;k<d;k++) div *= 10;
+      int32_t whole = v / div, frac = v % div; if (frac < 0) frac = -frac;
+      if (v < 0 && whole == 0) snprintf(out, outSize, "-0.%0*ld", (int)d, (long)frac);
+      else                     snprintf(out, outSize, "%ld.%0*ld", (long)whole, (int)d, (long)frac);
+      return;
+    }
+    default: {
+      // Численные: если в e.text есть форматная строка вида "%d%%" — используем.
+      // Проверяем есть ли в ней ровно один спец %d/%u/%i/%ld.
+      const char* fmt = e.hasText ? e.text : nullptr;
+      bool useFmt = false;
+      if (fmt && fmt[0]) {
+        // безопасный фильтр: пусть будет хотя бы один %d/%u, и нет %s/%n.
+        bool hasInt = false; bool bad = false;
+        for (const char* p = fmt; *p; p++) {
+          if (*p == '%' && p[1]) {
+            char c = p[1];
+            if (c == '%') { p++; continue; }
+            // пропустим флаги/ширину
+            const char* q = p+1;
+            while (*q == '-' || *q == '+' || *q == ' ' || *q == '0' || *q == '#') q++;
+            while (*q >= '0' && *q <= '9') q++;
+            if (*q == '.') { q++; while (*q >= '0' && *q <= '9') q++; }
+            // длины: l, ll, h, hh
+            while (*q == 'l' || *q == 'h') q++;
+            char conv = *q;
+            if (conv == 'd' || conv == 'i' || conv == 'u') { hasInt = true; p = q; }
+            else { bad = true; break; }
+          }
+        }
+        if (hasInt && !bad) useFmt = true;
+      }
+      if (useFmt) {
+        // snprintf с безопасным выводом long
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+        snprintf(out, outSize, fmt, (long)v);
+#pragma GCC diagnostic pop
+      } else {
+        if (editor.isSigned) snprintf(out, outSize, "%ld", (long)v);
+        else                 snprintf(out, outSize, "%lu", (unsigned long)(uint32_t)v);
+      }
+      return;
+    }
+  }
+}
+
+// Применение выбранного значения.
+bool applyEditorValue() {
+  EntryInfo& e = curDir.entries[editor.entryIdx];
+  int32_t v = editor.vmin + (int32_t)editor.cursor * editor.vstep;
+  uint8_t bytes[8] = {0};
+  uint16_t sz = editor.varSize;
+  if (sz > 8) sz = 8;
+  // выполним LEупаковку в нужный размер (сигнал/без) — сервер сам правильно разопьёт по типу.
+  uint32_t u = (uint32_t)v;
+  for (uint16_t k = 0; k < sz; k++) bytes[k] = (uint8_t)(u >> (8*k));
+  // для sz>4 расширим знаком (Int64/Uint64): повторяем знаковый октет
+  if (sz > 4) {
+    uint8_t pad = (editor.isSigned && (v < 0)) ? 0xFF : 0x00;
+    for (uint16_t k = 4; k < sz; k++) bytes[k] = pad;
+  }
+
+  setResult.received = false;
+  pending = { WK_SET, targetAddr, curDirIndex, editor.entryIdx, millis() };
+  bool sent = sendValueSet(targetAddr, curDirIndex, editor.entryIdx, bytes, sz);
+  if (!sent) { Serial.println("  sendValueSet failed"); pending.kind = WK_NONE; return false; }
+  // ждём ответ ErrorCode (1 байт на 0x39A)
+  uint32_t t0 = millis();
+  while (millis() - t0 < 1000 && !setResult.received) {
+    twai_message_t m; while (twai_receive(&m, 0) == ESP_OK) handleFrame(m);
+    delay(2);
+  }
+  pending.kind = WK_NONE;
+  if (!setResult.received) { Serial.println("  ValueSet: response timeout"); return false; }
+  Serial.printf("  ValueSet ok=%u err=%u\n", setResult.errorCode == 0, setResult.errorCode);
+  // Обновим локально отображаемое значение, если сервер принял.
+  if (setResult.errorCode == 0) {
+    e.valueLen = (uint8_t)sz;
+    for (uint16_t k = 0; k < sz; k++) e.value[k] = bytes[k];
+    e.hasValue = true;
+    // Перечитаем с сервера — сервер мог обрезать значение по Min/Max,
+    // и для обычных (не LiveUpdate) параметров без этого UI покажет старое.
+    e.hasValue = false;
+    pending = { WK_VALUE, targetAddr, curDirIndex, editor.entryIdx, millis() };
+    reqEntryVariable(targetAddr, curDirIndex, editor.entryIdx);
+    waitFor(500, [](){ return curDir.entries[editor.entryIdx].hasValue; });
+    pending.kind = WK_NONE;
+  }
+  return setResult.errorCode == 0;
+}
+
 void handleSelect() {
   if (cursor >= curDir.entrySize) return;
   EntryInfo& e = curDir.entries[cursor];
@@ -934,10 +1307,48 @@ void handleSelect() {
     uint16_t childDir = e.varSize;
     Serial.printf("  → folder %u\n", childDir);
     enterFolder(childDir);
+  } else if (isEditable(e)) {
+    if (prepareEditor(cursor)) {
+      Serial.printf("  ✎ edit %s: type=%u min=%ld max=%ld step=%ld count=%u\n",
+                    e.name, e.type, (long)editor.vmin, (long)editor.vmax, (long)editor.vstep, editor.count);
+      appState = S_EDIT;
+    } else {
+      Serial.printf("  edit prepare failed for %s\n", e.name);
+    }
   } else {
-    // value-параметр — пока только показываем подробности; редактирование добавим позже
-    Serial.printf("  Entry select: %s mode=0x%02X\n", e.name, e.mode);
+    Serial.printf("  Entry select: %s mode=0x%02X (read-only)\n", e.name, e.mode);
   }
+}
+
+// ====== Отрисовка редактора ======
+void drawEditor() {
+  display.clearDisplay();
+  EntryInfo& e = curDir.entries[editor.entryIdx];
+  drawHeader(e.name);
+
+  const uint8_t VIS_ROWS = 4;
+  if (editor.cursor < editor.scrollTop) editor.scrollTop = editor.cursor;
+  if (editor.cursor >= editor.scrollTop + VIS_ROWS) editor.scrollTop = editor.cursor - VIS_ROWS + 1;
+
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  for (uint8_t r = 0; r < VIS_ROWS; r++) {
+    uint16_t i = editor.scrollTop + r;
+    if (i >= editor.count) break;
+    int16_t y = 12 + r * 10;
+    bool sel = (i == editor.cursor);
+    if (sel) display.fillRect(0, y - 1, SCREEN_WIDTH, 9, SSD1306_WHITE);
+    display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
+    char buf[28]; formatEditorOption(i, buf, sizeof(buf));
+    display.setCursor(2, y);
+    display.print(buf);
+  }
+
+  char foot[32];
+  snprintf(foot, sizeof(foot), "%u/%u  S=apply B=cancel", editor.cursor + 1, editor.count);
+  drawFooter(foot);
+  display.display();
 }
 
 // ====== setup / loop ======
@@ -1019,6 +1430,24 @@ void loop() {
         refreshLiveValues(targetAddr, curDirIndex);
       }
       drawBrowse();
+      break;
+    }
+    case S_EDIT: {
+      if (pollButton(BI_UP)   && editor.cursor > 0) editor.cursor--;
+      if (pollButton(BI_DOWN) && editor.cursor + 1 < editor.count) editor.cursor++;
+      if (pollButton(BI_BACK)) {
+        Serial.println("  edit cancelled");
+        appState = S_BROWSE;
+      } else if (pollButton(BI_SEL)) {
+        // Показать "Applying..." и отправить
+        drawLoading("applying...");
+        bool ok = applyEditorValue();
+        if (ok) drawLoading("applied"); else drawLoading("error");
+        delay(400);
+        appState = S_BROWSE;
+      } else {
+        drawEditor();
+      }
       break;
     }
   }
