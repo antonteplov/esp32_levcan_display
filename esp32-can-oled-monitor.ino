@@ -703,10 +703,10 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
     pending = { WK_ENTRY, target, dirIndex, i, millis() };
     bool ok = false;
     // Шаг А: Data + Name
-    for (int retry = 0; retry < 3 && !ok; retry++) {
+    for (int retry = 0; retry < 2 && !ok; retry++) {
       if (retry > 0) resetAllChannels();
       reqEntry(target, dirIndex, i);
-      ok = waitFor(1500, entryNameReady);
+      ok = waitFor(800, entryNameReady);
       if (!ok) Serial.printf("    retry entry %u data/name (hasData=%u hasName=%u)\n",
                              i, curDir.entries[i].hasData, curDir.entries[i].hasName);
     }
@@ -726,12 +726,12 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
                  || (e.type == LCP_Int32)     || (e.type == LCP_Uint32)
                  || (e.type == LCP_Int64)     || (e.type == LCP_Uint64);
     if (needDesc) {
-      delay(20);
+      delay(5);
       bool dok = false;
-      for (int retry = 0; retry < 3 && !dok; retry++) {
+      for (int retry = 0; retry < 2 && !dok; retry++) {
         if (retry > 0) resetAllChannels();
         reqEntryDescriptor(target, dirIndex, i);
-        dok = waitFor(1500, entryDescReady);
+        dok = waitFor(800, entryDescReady);
         if (!dok) Serial.printf("    retry entry %u desc\n", i);
       }
       if (!dok) Serial.printf("  entry %u: skip desc after retries\n", i);
@@ -740,22 +740,28 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
     // Шаг А'': Text.
     //   Enum/Bool — список вариантов через '\n'.
     //   Int32/Uint32/Int64/Uint64/Decimal32 — format-строка ("%d%%", "%u sec", "%s*C" и т.п.).
-    //   Запрашиваем только если сервер сообщил textSize > 0.
-    bool needText = (e.textSize > 0) && (
+    //
+    // ВАЖНО: alight server считает TextSize = strlen(name) + strlen(textData).
+    // Если у entry textData = NULL (например, у большинства Bool — встроенные off/ON),
+    // сервер всё равно вернёт textSize = len(name), но на REQ_TEXT не пришлёт ничего.
+    // Поэтому реальное наличие Text определяем как textSize > strlen(name).
+    uint16_t nameLen = strlen(e.name);
+    bool hasRealText = (e.textSize > nameLen);
+    bool needText = hasRealText && (
         e.type == LCP_Enum   || e.type == LCP_Bool   ||
         e.type == LCP_Int32  || e.type == LCP_Uint32 ||
         e.type == LCP_Int64  || e.type == LCP_Uint64 ||
         e.type == LCP_Decimal32);
     if (needText) {
-      delay(20);
+      delay(5);
       bool tok = false;
-      for (int retry = 0; retry < 3 && !tok; retry++) {
+      // 1 ретрай при 600 мс — text опционален, fallback есть.
+      for (int retry = 0; retry < 1 && !tok; retry++) {
         if (retry > 0) resetAllChannels();
         reqEntryText(target, dirIndex, i);
-        tok = waitFor(1500, entryTextReady);
-        if (!tok) Serial.printf("    retry entry %u text\n", i);
+        tok = waitFor(600, entryTextReady);
+        if (!tok) Serial.printf("    skip entry %u text (no response)\n", i);
       }
-      if (!tok) Serial.printf("  entry %u: skip text after retries\n", i);
     }
 
     // Шаг Б: Value (если имеет смысл)
@@ -763,18 +769,18 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
                   && ((e.mode & 0x02) == 0)  // не WriteOnly
                   && (e.varSize > 0);
     if (needValue) {
-      delay(20);  // лёгкая пауза, чтобы alight разгрузил TX-очередь
+      delay(5);  // лёгкая пауза, чтобы alight разгрузил TX-очередь
       bool vok = false;
-      for (int retry = 0; retry < 3 && !vok; retry++) {
+      for (int retry = 0; retry < 2 && !vok; retry++) {
         if (retry > 0) resetAllChannels();
         reqEntryVariable(target, dirIndex, i);
-        vok = waitFor(1500, entryValueReady);
+        vok = waitFor(800, entryValueReady);
         if (!vok) Serial.printf("    retry entry %u value\n", i);
       }
       if (!vok) Serial.printf("  entry %u: skip value after retries\n", i);
     }
     pending.kind = WK_NONE;
-    delay(20);
+    delay(5);
   }
   return true;
 }

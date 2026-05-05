@@ -1,6 +1,6 @@
-# ESP32 CAN OLED Monitor
+# ESP32 LEVCAN OLED Monitor
 
-Сборка и прошивка тестового скетча для платы ESP32 с OLED и внешним CAN-трансивером TJA1050 без Arduino IDE, через `arduino-cli`.[1][2]
+Сборка и прошивка скетча для платы ESP32 с OLED и внешним CAN-трансивером TJA1050 без Arduino IDE, через `arduino-cli`.[1][2]
 
 ## Что делает скетч
 
