@@ -356,7 +356,7 @@ void cp1251ToAscii(const uint8_t* src, uint16_t srcLen, char* dst, size_t dstSiz
   size_t di = 0;
   for (uint16_t si = 0; si < srcLen && di + 1 < dstSize; si++) {
     uint8_t c = src[si]; if (c == 0) break;
-    if (c == 0xB0) { if (di + 4 < dstSize) { dst[di++]=' '; dst[di++]='d'; dst[di++]='e'; dst[di++]='g'; } }
+    if (c == 0xB0) { /* ° — выкидываем символ: в этом шрифте "*" слишком выделяется. Остаются "42C" / "42 C". */ }
     else if (c < 0x80) dst[di++] = (char)c;
     else if (c == 0xA8) { if (di + 2 < dstSize) { dst[di++]='Y'; dst[di++]='o'; } }
     else if (c == 0xB8) { if (di + 2 < dstSize) { dst[di++]='y'; dst[di++]='o'; } }
@@ -737,9 +737,15 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
       if (!dok) Serial.printf("  entry %u: skip desc after retries\n", i);
     }
 
-    // Шаг А'': Text — для Enum/Bool это список значений через '\n'.
-    // Запрашиваем только если сервер сообщил textSize > 0 (иначе Bool берёт встроенный 'off\nON').
-    bool needText = (e.type == LCP_Enum || e.type == LCP_Bool) && (e.textSize > 0);
+    // Шаг А'': Text.
+    //   Enum/Bool — список вариантов через '\n'.
+    //   Int32/Uint32/Int64/Uint64/Decimal32 — format-строка ("%d%%", "%u sec", "%s*C" и т.п.).
+    //   Запрашиваем только если сервер сообщил textSize > 0.
+    bool needText = (e.textSize > 0) && (
+        e.type == LCP_Enum   || e.type == LCP_Bool   ||
+        e.type == LCP_Int32  || e.type == LCP_Uint32 ||
+        e.type == LCP_Int64  || e.type == LCP_Uint64 ||
+        e.type == LCP_Decimal32);
     if (needText) {
       delay(20);
       bool tok = false;
@@ -911,6 +917,48 @@ static bool pickEnumLabel(const char* src, uint32_t idx, char* out, size_t outSi
   return true;
 }
 
+// Проверяет безопасность format-строки из alight (из entry.Text для LCP_Decimal/LCP_Int/LCP_Uint).
+// Разрешаем ровно один конвертер — буква из mode (одна из 'd','i','u','s'),
+// флаги/ширину/длину игнорируем. %% разрешён.
+// Возвращает true, если безопасна и в *modeOut ложит 'd' / 'u' / 's'.
+static bool checkSafeFormat(const char* fmt, char* modeOut) {
+  if (!fmt || !fmt[0]) return false;
+  int converters = 0; char mode = 0;
+  for (const char* p = fmt; *p; p++) {
+    if (*p != '%' || !p[1]) continue;
+    if (p[1] == '%') { p++; continue; }
+    const char* q = p + 1;
+    while (*q == '-' || *q == '+' || *q == ' ' || *q == '0' || *q == '#') q++;
+    while (*q >= '0' && *q <= '9') q++;
+    if (*q == '.') { q++; while (*q >= '0' && *q <= '9') q++; }
+    while (*q == 'l' || *q == 'h') q++;
+    char c = *q;
+    if (c == 'd' || c == 'i')      mode = 'd';
+    else if (c == 'u')             mode = 'u';
+    else if (c == 's')             mode = 's';
+    else                            return false;
+    converters++;
+    p = q;
+  }
+  if (converters != 1) return false;
+  if (modeOut) *modeOut = mode;
+  return true;
+}
+
+// Применить format-строку из alight к уже отформатированному числу/строке.
+// Если fmt безопасен — пишем в out и возвращаем true. Иначе false.
+static bool applyTextFormat(const char* fmt, long ival, const char* sval, char* out, size_t outSize) {
+  char mode = 0;
+  if (!checkSafeFormat(fmt, &mode)) return false;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+  if (mode == 's') snprintf(out, outSize, fmt, sval ? sval : "");
+  else             snprintf(out, outSize, fmt, ival);
+#pragma GCC diagnostic pop
+  return true;
+}
+
 void formatValue(const EntryInfo& e, char* out, size_t outSize) {
   if (!e.hasValue) { out[0] = '?'; out[1] = 0; return; }
   switch (e.type) {
@@ -923,11 +971,17 @@ void formatValue(const EntryInfo& e, char* out, size_t outSize) {
     }
     case LCP_Int32: {
       int32_t v = (int32_t)(e.value[0] | (e.value[1]<<8) | (e.value[2]<<16) | (e.value[3]<<24));
-      snprintf(out, outSize, "%ld", (long)v); break;
+      char raw[16]; snprintf(raw, sizeof(raw), "%ld", (long)v);
+      if (e.hasText && applyTextFormat(e.text, (long)v, raw, out, outSize)) break;
+      snprintf(out, outSize, "%s", raw);
+      break;
     }
     case LCP_Uint32: {
       uint32_t v = (uint32_t)(e.value[0] | (e.value[1]<<8) | (e.value[2]<<16) | (e.value[3]<<24));
-      snprintf(out, outSize, "%lu", (unsigned long)v); break;
+      char raw[16]; snprintf(raw, sizeof(raw), "%lu", (unsigned long)v);
+      if (e.hasText && applyTextFormat(e.text, (long)v, raw, out, outSize)) break;
+      snprintf(out, outSize, "%s", raw);
+      break;
     }
     case LCP_Decimal32: {
       // Variable: int8/int16/int32 со знаком (судим по e.varSize).
@@ -940,19 +994,21 @@ void formatValue(const EntryInfo& e, char* out, size_t outSize) {
       else if (e.valueLen >= 1) { v = (int8_t)e.value[0]; }
       uint8_t decimals = 0;
       if (e.hasDesc && e.descLen >= 13) decimals = e.desc[12];
+      // Сначала формируем raw-строку без единиц (она же пойдёт в %s).
+      char raw[20];
       if (decimals == 0) {
-        snprintf(out, outSize, "%ld", (long)v);
+        snprintf(raw, sizeof(raw), "%ld", (long)v);
       } else {
         int32_t div = 1; for (uint8_t k = 0; k < decimals; k++) div *= 10;
         int32_t whole = v / div;
         int32_t frac  = v % div; if (frac < 0) frac = -frac;
-        // знаков после точки = decimals (с ведущими нулями), ограничиваем до 6
         if (decimals > 6) decimals = 6;
-        char fmt[16]; snprintf(fmt, sizeof(fmt), "%%ld.%%0%uld", (unsigned)decimals);
-        // знак "−" лежит в whole когда он не ноль, иначе добавим вручную для -0.х
-        if (v < 0 && whole == 0) snprintf(out, outSize, "-0.%0*ld", (int)decimals, (long)frac);
-        else                     snprintf(out, outSize, fmt, (long)whole, (long)frac);
+        if (v < 0 && whole == 0) snprintf(raw, sizeof(raw), "-0.%0*ld", (int)decimals, (long)frac);
+        else                     snprintf(raw, sizeof(raw), "%ld.%0*ld", (long)whole, (int)decimals, (long)frac);
       }
+      // Если в параметре есть format-строка (напр. "%s*C") — применим её к raw.
+      if (e.hasText && applyTextFormat(e.text, (long)v, raw, out, outSize)) break;
+      snprintf(out, outSize, "%s", raw);
       break;
     }
     case LCP_Float: {
@@ -1002,26 +1058,41 @@ void drawBrowse() {
     else display.setTextColor(SSD1306_WHITE);
 
     display.setCursor(2, y + 1);
-    char prefix = ' ';
-    if (e.type == LCP_Folder) prefix = '>';
-    else if (e.type == LCP_Label) prefix = '#';
-    char val[12] = "";
+    // Префикс рисуем только для Folder/Label.
+    // Для обычных пунктов освобождённый столбец отдаём имени.
+    bool hasPrefix = (e.type == LCP_Folder) || (e.type == LCP_Label);
+    char prefix = (e.type == LCP_Folder) ? '>' : (e.type == LCP_Label ? '#' : ' ');
+
+    // Сначала формируем значение (до 9 символов), имя занимает всё что осталось.
+    char val[14] = "";
     if (e.hasValue) formatValue(e, val, sizeof(val));
-    // Окно 21 символ (шрифт 6x8): prefix(1) + name(14) + value(6).
-    // ~70% под имя, ~30% под значение — обрезка с '~' в конце.
-    char nm[15];
-    {
-      size_t L = strlen(e.name);
-      if (L <= 14) { strcpy(nm, e.name); }
-      else         { memcpy(nm, e.name, 13); nm[13] = '~'; nm[14] = 0; }
-    }
-    char vs[7];
+    char vs[10];
     {
       size_t L = strlen(val);
-      if (L <= 6) { strcpy(vs, val); }
-      else        { memcpy(vs, val, 5); vs[5] = '~'; vs[6] = 0; }
+      const size_t VMAX = 9;
+      if (L <= VMAX) { strcpy(vs, val); }
+      else           { memcpy(vs, val, VMAX-1); vs[VMAX-1] = '~'; vs[VMAX] = 0; }
     }
-    display.printf("%c%-14s%6s", prefix, nm, vs);
+    size_t vlen = strlen(vs);
+
+    // Общая ширина окна = 21 символ. Из них вычитаем prefix (если есть)
+    // и один разделительный пробел между именем и значением (если в пункте есть значение).
+    int total   = 21;
+    int prefixW = hasPrefix ? 1 : 0;
+    int sepW    = (vlen > 0) ? 1 : 0;
+    int nameMax = total - prefixW - sepW - (int)vlen;
+    if (nameMax < 6)  nameMax = 6;
+    if (nameMax > 20) nameMax = 20;
+    char nm[24];
+    {
+      size_t L = strlen(e.name);
+      if ((int)L <= nameMax) { strcpy(nm, e.name); }
+      else                   { memcpy(nm, e.name, nameMax - 1); nm[nameMax - 1] = '~'; nm[nameMax] = 0; }
+    }
+    int valWidth = total - prefixW - nameMax;   // включает сепаратор
+    if (valWidth < 0) valWidth = 0;
+    if (hasPrefix) display.printf("%c%-*s%*s", prefix, nameMax, nm, valWidth, vs);
+    else           display.printf("%-*s%*s",            nameMax, nm, valWidth, vs);
   }
   display.setTextColor(SSD1306_WHITE);
   display.fillRect(0, SCREEN_HEIGHT-9, SCREEN_WIDTH, 9, SSD1306_BLACK);
@@ -1204,50 +1275,25 @@ void formatEditorOption(uint16_t i, char* out, size_t outSize) {
     }
     case LCP_Decimal32: {
       uint8_t d = editor.decimals; if (d > 6) d = 6;
-      if (d == 0) { snprintf(out, outSize, "%ld", (long)v); return; }
-      int32_t div = 1; for (uint8_t k=0;k<d;k++) div *= 10;
-      int32_t whole = v / div, frac = v % div; if (frac < 0) frac = -frac;
-      if (v < 0 && whole == 0) snprintf(out, outSize, "-0.%0*ld", (int)d, (long)frac);
-      else                     snprintf(out, outSize, "%ld.%0*ld", (long)whole, (int)d, (long)frac);
+      char raw[20];
+      if (d == 0) { snprintf(raw, sizeof(raw), "%ld", (long)v); }
+      else {
+        int32_t div = 1; for (uint8_t k=0;k<d;k++) div *= 10;
+        int32_t whole = v / div, frac = v % div; if (frac < 0) frac = -frac;
+        if (v < 0 && whole == 0) snprintf(raw, sizeof(raw), "-0.%0*ld", (int)d, (long)frac);
+        else                     snprintf(raw, sizeof(raw), "%ld.%0*ld", (long)whole, (int)d, (long)frac);
+      }
+      if (e.hasText && applyTextFormat(e.text, (long)v, raw, out, outSize)) return;
+      snprintf(out, outSize, "%s", raw);
       return;
     }
     default: {
-      // Численные: если в e.text есть форматная строка вида "%d%%" — используем.
-      // Проверяем есть ли в ней ровно один спец %d/%u/%i/%ld.
-      const char* fmt = e.hasText ? e.text : nullptr;
-      bool useFmt = false;
-      if (fmt && fmt[0]) {
-        // безопасный фильтр: пусть будет хотя бы один %d/%u, и нет %s/%n.
-        bool hasInt = false; bool bad = false;
-        for (const char* p = fmt; *p; p++) {
-          if (*p == '%' && p[1]) {
-            char c = p[1];
-            if (c == '%') { p++; continue; }
-            // пропустим флаги/ширину
-            const char* q = p+1;
-            while (*q == '-' || *q == '+' || *q == ' ' || *q == '0' || *q == '#') q++;
-            while (*q >= '0' && *q <= '9') q++;
-            if (*q == '.') { q++; while (*q >= '0' && *q <= '9') q++; }
-            // длины: l, ll, h, hh
-            while (*q == 'l' || *q == 'h') q++;
-            char conv = *q;
-            if (conv == 'd' || conv == 'i' || conv == 'u') { hasInt = true; p = q; }
-            else { bad = true; break; }
-          }
-        }
-        if (hasInt && !bad) useFmt = true;
-      }
-      if (useFmt) {
-        // snprintf с безопасным выводом long
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-security"
-#pragma GCC diagnostic ignored "-Wformat-nonliteral"
-        snprintf(out, outSize, fmt, (long)v);
-#pragma GCC diagnostic pop
-      } else {
-        if (editor.isSigned) snprintf(out, outSize, "%ld", (long)v);
-        else                 snprintf(out, outSize, "%lu", (unsigned long)(uint32_t)v);
-      }
+      // Численные (Int32/Uint32/Int64/Uint64): сначала raw, затем format-строка из e.text.
+      char raw[20];
+      if (editor.isSigned) snprintf(raw, sizeof(raw), "%ld", (long)v);
+      else                 snprintf(raw, sizeof(raw), "%lu", (unsigned long)(uint32_t)v);
+      if (e.hasText && applyTextFormat(e.text, (long)v, raw, out, outSize)) return;
+      snprintf(out, outSize, "%s", raw);
       return;
     }
   }
