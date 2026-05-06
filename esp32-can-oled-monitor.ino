@@ -32,17 +32,33 @@
 #include "driver/twai.h"
 
 // ====== HW ======
+// OLED SSD1306 — I²C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_ADDR 0x3C
 #define OLED_SDA 5
 #define OLED_SCL 4
+// CAN-трансивер TJA1050
 #define CAN_TX GPIO_NUM_25
 #define CAN_RX GPIO_NUM_26
+// Кнопки (active-low, внутренние pull-up)
 #define BTN_BACK   13
 #define BTN_UP     14
 #define BTN_DOWN   27
 #define BTN_SELECT 33
+// Внешний USB→UART конвертер для отладочного лога.
+// Основной USB-порт (Serial = UART0, GPIO 1/3, через встроенный CP210x виден как /dev/ttyUSB0)
+// в rc2.1 отведён под VT100-интерфейс меню, а отладка уходит на UART1:
+//   • ESP32 GPIO 10 (TX1) → RX внешнего конвертера
+//   • ESP32 GPIO  9 (RX1) ← TX внешнего конвертера
+//   • GND общий с ESP32
+// 115200-N-1, принимать любым терминалом (minicom/screen/picocom).
+// ПРИМЕЧАНИЕ: на ESP32 GPIO 9/10 внутренне используются flash в QIO/QOUT режиме.
+// На LOLIN32 flash подключен по DIO, поэтому эти пины свободны. UART1 перемапим на 9/10 явно.
+#define DBG_UART_NUM    1
+#define DBG_UART_TX     10
+#define DBG_UART_RX     9
+#define DBG_UART_BAUD   115200
 
 // ====== LEVCAN ======
 static const uint8_t  MY_ADDR     = 100;
@@ -92,6 +108,10 @@ static const bool VERBOSE_CTS = false;
 // #define ENABLE_FULL_WALKER 1   // раскомментируй чтобы по B+S при загрузке снять полный дамп
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Отладочный UART (на внешний USB→UART конвертер).
+// На этот порт идёт весь отладочный вывод (Dbg.print*); штатный Serial резервируется за VT100-меню.
+HardwareSerial Dbg(DBG_UART_NUM);
 
 // ====== Структуры данных ======
 struct Node {
@@ -280,7 +300,7 @@ bool sendTcpToServer(uint8_t target, uint16_t msgId, const uint8_t* data, uint16
       twai_message_t m; while (twai_receive(&m, 0) == ESP_OK) handleFrame(m);
       delay(2);
     }
-    if (!txWait.gotCts) { txWait.active=false; Serial.println("  TX: CTS timeout"); return false; }
+    if (!txWait.gotCts) { txWait.active=false; Dbg.println("  TX: CTS timeout"); return false; }
   }
   // оставшиеся фреймы
   while (pos < len) {
@@ -300,7 +320,7 @@ bool sendTcpToServer(uint8_t target, uint16_t msgId, const uint8_t* data, uint16
         twai_message_t m; while (twai_receive(&m, 0) == ESP_OK) handleFrame(m);
         delay(2);
       }
-      if (!txWait.gotCts) { txWait.active=false; Serial.println("  TX: mid CTS timeout"); return false; }
+      if (!txWait.gotCts) { txWait.active=false; Dbg.println("  TX: mid CTS timeout"); return false; }
     }
   }
   // ждём final ACK
@@ -312,7 +332,7 @@ bool sendTcpToServer(uint8_t target, uint16_t msgId, const uint8_t* data, uint16
     }
     bool ok = txWait.gotFinalAck;
     txWait.active = false;
-    if (!ok) Serial.println("  TX: final ACK timeout");
+    if (!ok) Dbg.println("  TX: final ACK timeout");
     return ok;
   }
 }
@@ -405,7 +425,7 @@ void resetAllChannels() { for (uint8_t i = 0; i < CHAN_COUNT; i++) resetChannel(
 bool sendCTS(uint8_t target, uint16_t msgId, uint8_t parity, uint8_t rts, uint8_t eom) {
   LcHeader h{}; h.source=MY_ADDR; h.target=target; h.msgId=msgId;
   h.parity=parity; h.rts=rts; h.eom=eom; h.prio=0;
-  if (VERBOSE_CTS) Serial.printf("    <- CTS to %u msg=0x%X par=%u rts=%u eom=%u\n", target, msgId, parity, rts, eom);
+  if (VERBOSE_CTS) Dbg.printf("    <- CTS to %u msg=0x%X par=%u rts=%u eom=%u\n", target, msgId, parity, rts, eom);
   return sendFrame(packId(h), nullptr, 0, /*rtr=*/true);
 }
 
@@ -433,7 +453,7 @@ void onDeviceName(uint8_t srcAddr, const uint8_t* d, uint16_t len) {
   cp1251ToAscii(d, n, nodes[i].deviceName, NAME_BUF);
   nodes[i].hasDeviceName = true;
   nodes[i].lastSeenMs = millis();
-  Serial.printf("  Node %u DeviceName=\"%s\"\n", srcAddr, nodes[i].deviceName);
+  Dbg.printf("  Node %u DeviceName=\"%s\"\n", srcAddr, nodes[i].deviceName);
   // Сразу поинтересуемся NodeName, если ещё не знаем.
   if (!nodes[i].hasNodeName) reqNodeName(srcAddr);
 }
@@ -444,7 +464,7 @@ void onNodeName(uint8_t srcAddr, const uint8_t* d, uint16_t len) {
   cp1251ToAscii(d, n, nodes[i].nodeName, NAME_BUF);
   nodes[i].hasNodeName = true;
   nodes[i].lastSeenMs = millis();
-  Serial.printf("  Node %u NodeName=\"%s\"\n", srcAddr, nodes[i].nodeName);
+  Dbg.printf("  Node %u NodeName=\"%s\"\n", srcAddr, nodes[i].nodeName);
 }
 
 void onDirData(uint16_t dirIdx, const uint8_t* d, uint16_t len) {
@@ -452,27 +472,27 @@ void onDirData(uint16_t dirIdx, const uint8_t* d, uint16_t len) {
   uint16_t entrySize = d[0] | (d[1] << 8);
   uint16_t nameSize  = d[2] | (d[3] << 8);
   uint16_t actualDir = d[4] | (d[5] << 8);
-  if (actualDir != dirIdx) { Serial.printf("  DirData dir mismatch %u/%u\n", actualDir, dirIdx); return; }
+  if (actualDir != dirIdx) { Dbg.printf("  DirData dir mismatch %u/%u\n", actualDir, dirIdx); return; }
   if (entrySize > MAX_ENTRIES_DIR || nameSize == 0 || nameSize > NAME_BUF) {
-    Serial.printf("  DirData bogus size es=%u ns=%u\n", entrySize, nameSize); return;
+    Dbg.printf("  DirData bogus size es=%u ns=%u\n", entrySize, nameSize); return;
   }
   curDir.known = true;
   curDir.entrySize = entrySize;
   curDir.nameSize  = nameSize;
-  Serial.printf("  DirData[%u]: entries=%u\n", dirIdx, entrySize);
+  Dbg.printf("  DirData[%u]: entries=%u\n", dirIdx, entrySize);
 }
 
 void onEntryData(uint16_t expectedEntry, const uint8_t* d, uint16_t len) {
   if (len < 4 || expectedEntry >= MAX_ENTRIES_DIR) return;
   uint16_t respEntry = d[2] | (d[3] << 8);
-  if (respEntry != expectedEntry) { Serial.printf("  Entry idx mismatch %u/%u\n", respEntry, expectedEntry); return; }
+  if (respEntry != expectedEntry) { Dbg.printf("  Entry idx mismatch %u/%u\n", respEntry, expectedEntry); return; }
   EntryInfo& e = curDir.entries[expectedEntry];
   e.type = d[0]; e.mode = d[1]; e.entryIdx = respEntry;
   if (len >= 6)  e.varSize  = d[4] | (d[5] << 8);
   if (len >= 8)  e.descSize = d[6] | (d[7] << 8);
   if (len >= 10) e.textSize = d[8] | (d[9] << 8);
   e.hasData = true;
-  Serial.printf("  EntryData[%u]: type=%s mode=0x%02X varSz=%u\n",
+  Dbg.printf("  EntryData[%u]: type=%s mode=0x%02X varSz=%u\n",
                 expectedEntry, typeName(e.type), e.mode, e.varSize);
 }
 
@@ -481,12 +501,12 @@ void onName(int16_t entryIdx, const uint8_t* d, uint16_t len) {
   char buf[NAME_BUF]; cp1251ToAscii(d, n, buf, sizeof(buf));
   if (entryIdx < 0) {
     strncpy(curDir.name, buf, NAME_BUF-1); curDir.name[NAME_BUF-1]=0;
-    Serial.printf("  DirName: \"%s\"\n", curDir.name);
+    Dbg.printf("  DirName: \"%s\"\n", curDir.name);
   }
   else if (entryIdx < MAX_ENTRIES_DIR) {
     EntryInfo& e = curDir.entries[entryIdx];
     strncpy(e.name, buf, NAME_BUF-1); e.name[NAME_BUF-1]=0; e.hasName = true;
-    Serial.printf("  EntryName[%u]: \"%s\"\n", (unsigned)entryIdx, e.name);
+    Dbg.printf("  EntryName[%u]: \"%s\"\n", (unsigned)entryIdx, e.name);
   }
 }
 
@@ -504,7 +524,7 @@ void onDesc(uint16_t entryIdx, const uint8_t* d, uint16_t len) {
   memcpy(e.desc, d, n); e.descLen = n; e.hasDesc = true;
 }
 void onValue(uint16_t entryIdx, const uint8_t* d, uint16_t len) {
-  Serial.printf("  EntryValue[%u]: len=%u\n", (unsigned)entryIdx, len);
+  Dbg.printf("  EntryValue[%u]: len=%u\n", (unsigned)entryIdx, len);
   if (entryIdx >= MAX_ENTRIES_DIR) return;
   EntryInfo& e = curDir.entries[entryIdx];
   uint16_t n = (len < sizeof(e.value)) ? len : sizeof(e.value);
@@ -544,7 +564,7 @@ void dispatchChannel(int idx) {
     if (msgId == MSG_PARAM_DATA && c.pos >= 1) {
       setResult.errorCode = c.buf[0];
       setResult.received  = true;
-      Serial.printf("  ValueSet response: errorCode=%u\n", c.buf[0]);
+      Dbg.printf("  ValueSet response: errorCode=%u\n", c.buf[0]);
     }
   }
   resetChannel(idx);
@@ -575,14 +595,14 @@ void handleFrame(const twai_message_t& m) {
     if (txWait.active && h.source == txWait.src && h.msgId == txWait.msgId) {
       if (h.rts == 1 && h.eom == 0) { txWait.gotCts = true; txWait.ctsParity = h.parity; }
       else if (h.rts == 0 && h.eom == 1) { txWait.gotFinalAck = true; }
-      if (VERBOSE_RX) Serial.printf("    RX RTR src=%u msg=0x%X rts=%u eom=%u par=%u\n",
+      if (VERBOSE_RX) Dbg.printf("    RX RTR src=%u msg=0x%X rts=%u eom=%u par=%u\n",
                                     h.source, h.msgId, h.rts, h.eom, h.parity);
     }
     return;
   }
 
   if (VERBOSE_RX) {
-    Serial.printf("    RX 0x%X src=%u msg=0x%X eom=%u par=%u rts=%u dlc=%u\n",
+    Dbg.printf("    RX 0x%X src=%u msg=0x%X eom=%u par=%u rts=%u dlc=%u\n",
                   m.identifier, h.source, h.msgId, h.eom, h.parity, h.rts, m.data_length_code);
   }
 
@@ -685,13 +705,13 @@ bool entryTextReady() {
 }
 
 bool loadDir(uint8_t target, uint16_t dirIndex) {
-  Serial.printf("[loadDir target=%u dir=%u]\n", target, dirIndex);
+  Dbg.printf("[loadDir target=%u dir=%u]\n", target, dirIndex);
   resetAllChannels();
   clearDir();
   // 1) Запрос DirInfo (data + name)
   pending = { WK_DIR, target, dirIndex, 0, millis() };
-  if (!reqDir(target, dirIndex)) { Serial.println("  reqDir TX fail"); return false; }
-  if (!waitFor(1500, dirNameReady)) { Serial.println("  dir timeout"); pending.kind=WK_NONE; return false; }
+  if (!reqDir(target, dirIndex)) { Dbg.println("  reqDir TX fail"); return false; }
+  if (!waitFor(1500, dirNameReady)) { Dbg.println("  dir timeout"); pending.kind=WK_NONE; return false; }
   pending.kind = WK_NONE;
 
   // 2) Для каждой entry — ДВА отдельных запроса:
@@ -707,11 +727,11 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
       if (retry > 0) resetAllChannels();
       reqEntry(target, dirIndex, i);
       ok = waitFor(800, entryNameReady);
-      if (!ok) Serial.printf("    retry entry %u data/name (hasData=%u hasName=%u)\n",
+      if (!ok) Dbg.printf("    retry entry %u data/name (hasData=%u hasName=%u)\n",
                              i, curDir.entries[i].hasData, curDir.entries[i].hasName);
     }
     if (!ok) {
-      Serial.printf("  entry %u: skip data/name after retries\n", i);
+      Dbg.printf("  entry %u: skip data/name after retries\n", i);
       pending.kind = WK_NONE; delay(20); continue;
     }
 
@@ -732,9 +752,9 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
         if (retry > 0) resetAllChannels();
         reqEntryDescriptor(target, dirIndex, i);
         dok = waitFor(800, entryDescReady);
-        if (!dok) Serial.printf("    retry entry %u desc\n", i);
+        if (!dok) Dbg.printf("    retry entry %u desc\n", i);
       }
-      if (!dok) Serial.printf("  entry %u: skip desc after retries\n", i);
+      if (!dok) Dbg.printf("  entry %u: skip desc after retries\n", i);
     }
 
     // Шаг А'': Text.
@@ -760,7 +780,7 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
         if (retry > 0) resetAllChannels();
         reqEntryText(target, dirIndex, i);
         tok = waitFor(600, entryTextReady);
-        if (!tok) Serial.printf("    skip entry %u text (no response)\n", i);
+        if (!tok) Dbg.printf("    skip entry %u text (no response)\n", i);
       }
     }
 
@@ -775,9 +795,9 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
         if (retry > 0) resetAllChannels();
         reqEntryVariable(target, dirIndex, i);
         vok = waitFor(800, entryValueReady);
-        if (!vok) Serial.printf("    retry entry %u value\n", i);
+        if (!vok) Dbg.printf("    retry entry %u value\n", i);
       }
-      if (!vok) Serial.printf("  entry %u: skip value after retries\n", i);
+      if (!vok) Dbg.printf("  entry %u: skip value after retries\n", i);
     }
     pending.kind = WK_NONE;
     delay(5);
@@ -810,8 +830,15 @@ enum BtnIdx { BI_BACK=0, BI_UP=1, BI_DOWN=2, BI_SEL=3 };
 void initButtons() {
   for (int i = 0; i < 4; i++) pinMode(btns[i].pin, INPUT_PULLUP);
 }
+// Виртуальные нажатия от VT100-терминала. kbPump() выставляет флаг,
+// pollButton() подхватывает и отдаёт однократно — так вся логика UI остаётся без изменений.
+static volatile bool kbInjected[4] = {false, false, false, false};
+
 // возвращает true один раз на нажатие (фронт)
 bool pollButton(int i) {
+  // Клавиатура VT100 — обрабатывается в приоритете.
+  if (kbInjected[i]) { kbInjected[i] = false; return true; }
+
   uint8_t s = digitalRead(btns[i].pin);
   uint32_t now = millis();
   if (s != btns[i].state && (now - btns[i].lastChangeMs) > 30) {
@@ -819,6 +846,64 @@ bool pollButton(int i) {
     if (s == 0) { btns[i].pressed = true; return true; }
   }
   return false;
+}
+
+// ====== Клавиатура VT100 (Serial → виртуальные кнопки) ======
+// Читаем из штатного Serial. Распознаём:
+//   ENTER (CR или LF) → SEL
+//   ESC без продолжения в течение 50 мс → BACK
+//   ESC [ A → UP, ESC [ B → DOWN
+//   ESC [ C / D — пропускаем (нет горизонтальных движений)
+//   k/j (как vim) → UP/DOWN — удобно на некоторых терминалах
+static int       kbEscState   = 0;        // 0=normal, 1=получен ESC, 2=получен ESC+[
+static uint32_t  kbEscStartMs = 0;
+
+void kbPump() {
+  // Тайм-аут одиночного ESC: если прошло >50мс и продолжения нет — это был ESC (BACK).
+  if (kbEscState == 1 && (millis() - kbEscStartMs) > 50) {
+    kbInjected[BI_BACK] = true;
+    kbEscState = 0;
+  }
+
+  while (Serial.available() > 0) {
+    int ch = Serial.read();
+    if (ch < 0) break;
+
+    if (kbEscState == 0) {
+      switch (ch) {
+        case 0x1B:                                  // ESC
+          kbEscState   = 1;
+          kbEscStartMs = millis();
+          break;
+        case '\r': case '\n':
+          kbInjected[BI_SEL] = true;
+          break;
+        case 'k': case 'K':
+          kbInjected[BI_UP] = true;
+          break;
+        case 'j': case 'J':
+          kbInjected[BI_DOWN] = true;
+          break;
+        default: break;                             // всё остальное игнорируем
+      }
+    } else if (kbEscState == 1) {
+      if (ch == '[') {
+        kbEscState = 2;
+      } else {
+        // ESC + что-то осмысленное, но не [ — трактуем как BACK и обработаем символ заново.
+        kbInjected[BI_BACK] = true;
+        kbEscState = 0;
+        // Одновременность редкая, поэтому просто теряем символ ch — это приемлемо.
+      }
+    } else if (kbEscState == 2) {
+      switch (ch) {
+        case 'A': kbInjected[BI_UP]   = true; break;
+        case 'B': kbInjected[BI_DOWN] = true; break;
+        default:  break;                            // C/D/H/F и др. пропускаем
+      }
+      kbEscState = 0;
+    }
+  }
 }
 
 // ====== UI ======
@@ -1324,7 +1409,7 @@ bool applyEditorValue() {
   setResult.received = false;
   pending = { WK_SET, targetAddr, curDirIndex, editor.entryIdx, millis() };
   bool sent = sendValueSet(targetAddr, curDirIndex, editor.entryIdx, bytes, sz);
-  if (!sent) { Serial.println("  sendValueSet failed"); pending.kind = WK_NONE; return false; }
+  if (!sent) { Dbg.println("  sendValueSet failed"); pending.kind = WK_NONE; return false; }
   // ждём ответ ErrorCode (1 байт на 0x39A)
   uint32_t t0 = millis();
   while (millis() - t0 < 1000 && !setResult.received) {
@@ -1332,8 +1417,8 @@ bool applyEditorValue() {
     delay(2);
   }
   pending.kind = WK_NONE;
-  if (!setResult.received) { Serial.println("  ValueSet: response timeout"); return false; }
-  Serial.printf("  ValueSet ok=%u err=%u\n", setResult.errorCode == 0, setResult.errorCode);
+  if (!setResult.received) { Dbg.println("  ValueSet: response timeout"); return false; }
+  Dbg.printf("  ValueSet ok=%u err=%u\n", setResult.errorCode == 0, setResult.errorCode);
   // Обновим локально отображаемое значение, если сервер принял.
   if (setResult.errorCode == 0) {
     e.valueLen = (uint8_t)sz;
@@ -1357,18 +1442,18 @@ void handleSelect() {
     // Для Folder дочерний dirIndex уже лежит в entry->VarSize и приходит в lc_entry_data_t
     // (см. levcan_paramserver.c:264 «dindex = entry->VarSize»). Никакой descriptor у folder нет.
     uint16_t childDir = e.varSize;
-    Serial.printf("  → folder %u\n", childDir);
+    Dbg.printf("  → folder %u\n", childDir);
     enterFolder(childDir);
   } else if (isEditable(e)) {
     if (prepareEditor(cursor)) {
-      Serial.printf("  ✎ edit %s: type=%u min=%ld max=%ld step=%ld count=%u\n",
+      Dbg.printf("  ✎ edit %s: type=%u min=%ld max=%ld step=%ld count=%u\n",
                     e.name, e.type, (long)editor.vmin, (long)editor.vmax, (long)editor.vstep, editor.count);
       appState = S_EDIT;
     } else {
-      Serial.printf("  edit prepare failed for %s\n", e.name);
+      Dbg.printf("  edit prepare failed for %s\n", e.name);
     }
   } else {
-    Serial.printf("  Entry select: %s mode=0x%02X (read-only)\n", e.name, e.mode);
+    Dbg.printf("  Entry select: %s mode=0x%02X (read-only)\n", e.name, e.mode);
   }
 }
 
@@ -1403,10 +1488,351 @@ void drawEditor() {
   display.display();
 }
 
+// ====== VT100 панель (дублирует OLED в терминал 80×24) ======
+// Отображение одновременное с OLED. Шапка содержит имя узла (DeviceName/NodeName)
+// и вторым рядом — контекст (название директории или имя редактируемого параметра).
+// Строки меню подрезаются/раскладываются ровно так же как на OLED, только окно шире — 78 символов.
+// Выделение выбранной строки — инверсия (ESC[7m).
+//
+// Для экономии пропускной способности и мерцания экран перерисовывается только при изменении signature
+// (хэш от всех видимых данных).
+
+static const uint8_t  VT_COLS = 80;
+static const uint8_t  VT_ROWS = 24;
+static const uint8_t  VT_LIST_TOP    = 4;            // первая строка меню (строки 1..3 — шапка + разделитель)
+static const uint8_t  VT_LIST_HEIGHT = 18;           // 18 видимых строк (ряды 4..21)
+static const uint8_t  VT_FOOTER_ROW   = 23;          // последняя строка
+static const uint8_t  VT_INNER_W      = VT_COLS - 2; // боковые вертикальные рамки "|"
+
+static uint32_t       vtLastSig    = 0;
+static bool           vtInitDone   = false;
+static AppState       vtLastState  = (AppState)-1;
+
+// Базовые ESC-последовательности
+static inline void vtClear()       { Serial.print("\x1B[2J"); }
+static inline void vtHome()        { Serial.print("\x1B[H");  }
+static inline void vtCursorOff()   { Serial.print("\x1B[?25l"); }
+static inline void vtReset()       { Serial.print("\x1B[0m");  }
+static inline void vtInverseOn()   { Serial.print("\x1B[7m");  }
+static inline void vtMoveTo(uint8_t row1, uint8_t col1) {  // 1-based
+  Serial.printf("\x1B[%u;%uH", (unsigned)row1, (unsigned)col1);
+}
+static inline void vtClearLine() { Serial.print("\x1B[2K"); }
+
+// FNV-1a 32-bit — дешёвый хэш для signature
+static uint32_t vtHashUpdate(uint32_t h, const void* data, size_t n) {
+  const uint8_t* p = (const uint8_t*)data;
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+  return h;
+}
+static uint32_t vtHashStr(uint32_t h, const char* s) {
+  if (!s) return h;
+  return vtHashUpdate(h, s, strlen(s));
+}
+
+// Печатает строку в окне ширины w с подрезкой и дополнением пробелами.
+static void vtPrintFitted(const char* s, int w, char fill = ' ') {
+  if (w <= 0) return;
+  int L = (int)strlen(s);
+  if (L <= w) {
+    Serial.print(s);
+    for (int i = L; i < w; i++) Serial.write((uint8_t)fill);
+  } else {
+    // Аналогично OLED: последний символ — '~', остальные (w-1) из исходной.
+    for (int i = 0; i < w - 1; i++) Serial.write((uint8_t)s[i]);
+    Serial.write((uint8_t)'~');
+  }
+}
+
+// Шапка: 2 строки. Первая — имя узла и контекст, вторая — разделитель.
+static void vtDrawHeader(const char* nodeName, const char* ctx) {
+  vtMoveTo(1, 1);
+  vtInverseOn();
+  // Имя узла (до 24 символов) | контекст (остаток) | время? Нет — компактно.
+  Serial.write((uint8_t)' ');
+  vtPrintFitted(nodeName ? nodeName : "-", 24);
+  Serial.print(" | ");
+  vtPrintFitted(ctx ? ctx : "", VT_COLS - 1 - 24 - 3 - 1);
+  Serial.write((uint8_t)' ');
+  vtReset();
+  // Разделитель
+  vtMoveTo(2, 1);
+  for (int i = 0; i < VT_COLS; i++) Serial.write((uint8_t)'-');
+  // Пустая строка перед меню
+  vtMoveTo(3, 1);
+  vtClearLine();
+}
+
+// Footer: инверсная строка внизу.
+static void vtDrawFooter(const char* foot) {
+  vtMoveTo(VT_FOOTER_ROW, 1);
+  vtClearLine();
+  vtMoveTo(VT_FOOTER_ROW, 1);
+  vtInverseOn();
+  Serial.write((uint8_t)' ');
+  vtPrintFitted(foot ? foot : "", VT_COLS - 2);
+  Serial.write((uint8_t)' ');
+  vtReset();
+}
+
+// Очистка строк меню (ряды 3..22)
+static void vtClearListArea() {
+  for (uint8_t r = 3; r < VT_FOOTER_ROW; r++) {
+    vtMoveTo(r, 1);
+    vtClearLine();
+  }
+}
+
+// Получить имя текущего узла (или "-" на стадии discover/devices)
+static const char* vtCurrentNodeName() {
+  if (selectedNode >= 0 && selectedNode < (int)nodeCount) {
+    const Node& n = nodes[selectedNode];
+    if (n.deviceName[0]) return n.deviceName;
+    if (n.nodeName[0])   return n.nodeName;
+  }
+  return "-";
+}
+
+// ----- Отдельные экраны -----
+
+static void vtDrawDiscover() {
+  vtClearListArea();
+  vtDrawHeader("LEVCAN", "Discover");
+  vtMoveTo(VT_LIST_TOP, 3);
+  Serial.printf("Searching CAN... found %u node(s)", (unsigned)nodeCount);
+  for (uint8_t i = 0; i < nodeCount; i++) {
+    vtMoveTo(VT_LIST_TOP + 2 + i, 3);
+    const Node& n = nodes[i];
+    const char* nm = n.deviceName[0] ? n.deviceName : (n.nodeName[0] ? n.nodeName : "?");
+    Serial.printf("addr=%-3u %s", (unsigned)n.addr, nm);
+  }
+  vtDrawFooter(nodeCount > 0 ? "ENTER=continue" : "ждём узлы LEVCAN...");
+}
+
+static void vtDrawDevices() {
+  vtClearListArea();
+  vtDrawHeader("LEVCAN", "Devices");
+  uint8_t maxRows = VT_LIST_HEIGHT;
+  if (maxRows > nodeCount) maxRows = nodeCount;
+  for (uint8_t i = 0; i < maxRows; i++) {
+    bool sel = ((int)i == selectedNode);
+    vtMoveTo(VT_LIST_TOP + i, 1);
+    if (sel) vtInverseOn();
+    char buf[80];
+    const Node& n = nodes[i];
+    const char* nm = n.deviceName[0] ? n.deviceName : (n.nodeName[0] ? n.nodeName : "?");
+    snprintf(buf, sizeof(buf), " %c addr=%-3u %s", sel ? '>' : ' ', (unsigned)n.addr, nm);
+    vtPrintFitted(buf, VT_COLS);
+    if (sel) vtReset();
+  }
+  vtDrawFooter("↑/↓ — выбор | ENTER=open | ESC=re-scan");
+}
+
+static void vtDrawLoading(const char* what) {
+  vtClearListArea();
+  vtDrawHeader(vtCurrentNodeName(), "loading");
+  vtMoveTo(VT_LIST_TOP + 2, 4);
+  Serial.printf("%s", what ? what : "...");
+  vtDrawFooter("");
+}
+
+static void vtDrawBrowse() {
+  vtClearListArea();
+  vtDrawHeader(vtCurrentNodeName(), curDir.name);
+
+  // Окно прокрутки: VT_LIST_HEIGHT видимых строк.
+  uint16_t vTop = scrollTop;
+  if (cursor < vTop) vTop = cursor;
+  if (cursor >= vTop + VT_LIST_HEIGHT) vTop = cursor - VT_LIST_HEIGHT + 1;
+
+  for (uint8_t r = 0; r < VT_LIST_HEIGHT; r++) {
+    uint16_t i = vTop + r;
+    if (i >= curDir.entrySize) break;
+    const EntryInfo& e = curDir.entries[i];
+    bool sel = (i == cursor);
+    vtMoveTo(VT_LIST_TOP + r, 1);
+
+    bool hasPrefix = (e.type == LCP_Folder) || (e.type == LCP_Label);
+    char prefix    = (e.type == LCP_Folder) ? '>' : (e.type == LCP_Label ? '#' : ' ');
+
+    // Значение — до 16 символов (в терминале места больше).
+    char val[32] = "";
+    if (e.hasValue) formatValue(e, val, sizeof(val));
+    char vs[18];
+    {
+      size_t L = strlen(val);
+      const size_t VMAX = 16;
+      if (L <= VMAX) { strcpy(vs, val); }
+      else           { memcpy(vs, val, VMAX-1); vs[VMAX-1] = '~'; vs[VMAX] = 0; }
+    }
+    size_t vlen = strlen(vs);
+
+    int total   = (int)VT_INNER_W - 2;     // -2: ведущий пробел + курсорный маркер
+    int prefixW = hasPrefix ? 1 : 0;
+    int sepW    = (vlen > 0) ? 1 : 0;
+    int nameMax = total - prefixW - sepW - (int)vlen;
+    if (nameMax < 8)  nameMax = 8;
+    if (nameMax > 60) nameMax = 60;
+    char nm[64];
+    {
+      size_t L = strlen(e.name);
+      if ((int)L <= nameMax) { strcpy(nm, e.name); }
+      else                   { memcpy(nm, e.name, nameMax - 1); nm[nameMax - 1] = '~'; nm[nameMax] = 0; }
+    }
+    int valWidth = total - prefixW - nameMax;
+    if (valWidth < 0) valWidth = 0;
+
+    if (sel) vtInverseOn();
+    Serial.printf(" %c", sel ? '>' : ' ');
+    if (hasPrefix) Serial.printf("%c%-*s%*s", prefix, nameMax, nm, valWidth, vs);
+    else           Serial.printf( "%-*s%*s",          nameMax, nm, valWidth, vs);
+    if (sel) vtReset();
+  }
+
+  // Footer
+  const char* selHint = "";
+  if (cursor < curDir.entrySize) {
+    const EntryInfo& ec = curDir.entries[cursor];
+    if (ec.type == LCP_Folder)   selHint = " ENTER=open";
+    else if (isEditable(ec))     selHint = " ENTER=edit";
+  }
+  char foot[80];
+  snprintf(foot, sizeof(foot), "%u/%u  ↑/↓  ESC=%s%s",
+           (unsigned)cursor + 1, (unsigned)curDir.entrySize,
+           dirStackPos > 0 ? "back" : "devices", selHint);
+  vtDrawFooter(foot);
+}
+
+static void vtDrawEditor() {
+  vtClearListArea();
+  const EntryInfo& e = curDir.entries[editor.entryIdx];
+  vtDrawHeader(vtCurrentNodeName(), e.name);
+
+  uint16_t vTop = editor.scrollTop;
+  if (editor.cursor < vTop) vTop = editor.cursor;
+  if (editor.cursor >= vTop + VT_LIST_HEIGHT) vTop = editor.cursor - VT_LIST_HEIGHT + 1;
+
+  for (uint8_t r = 0; r < VT_LIST_HEIGHT; r++) {
+    uint16_t i = vTop + r;
+    if (i >= editor.count) break;
+    bool sel = (i == editor.cursor);
+    vtMoveTo(VT_LIST_TOP + r, 1);
+    if (sel) vtInverseOn();
+    char buf[64]; formatEditorOption(i, buf, sizeof(buf));
+    char line[VT_COLS + 1];
+    snprintf(line, sizeof(line), " %c %s", sel ? '>' : ' ', buf);
+    vtPrintFitted(line, VT_COLS);
+    if (sel) vtReset();
+  }
+
+  char foot[80];
+  snprintf(foot, sizeof(foot), "%u/%u  ↑/↓  ENTER=apply  ESC=cancel",
+           (unsigned)editor.cursor + 1, (unsigned)editor.count);
+  vtDrawFooter(foot);
+}
+
+// Вычисляем signature текущего экрана — если не изменился, не перерисовываем (бережём пропускную способность).
+static uint32_t vtComputeSignature() {
+  uint32_t h = 2166136261u;
+  uint8_t st = (uint8_t)appState;
+  h = vtHashUpdate(h, &st, 1);
+  switch (appState) {
+    case S_DISCOVER: {
+      h = vtHashUpdate(h, &nodeCount, sizeof(nodeCount));
+      for (uint8_t i = 0; i < nodeCount; i++) {
+        h = vtHashUpdate(h, &nodes[i].addr, 1);
+        h = vtHashStr(h, nodes[i].deviceName);
+        h = vtHashStr(h, nodes[i].nodeName);
+      }
+      break;
+    }
+    case S_DEVICES: {
+      h = vtHashUpdate(h, &nodeCount, sizeof(nodeCount));
+      h = vtHashUpdate(h, &selectedNode, sizeof(selectedNode));
+      for (uint8_t i = 0; i < nodeCount; i++) {
+        h = vtHashUpdate(h, &nodes[i].addr, 1);
+        h = vtHashStr(h, nodes[i].deviceName);
+        h = vtHashStr(h, nodes[i].nodeName);
+      }
+      break;
+    }
+    case S_LOAD_DIR: {
+      // Ничего не меняется пока идёт загрузка — фиксируем.
+      h = vtHashStr(h, "LOADING");
+      break;
+    }
+    case S_BROWSE: {
+      h = vtHashStr(h, curDir.name);
+      h = vtHashUpdate(h, &cursor, sizeof(cursor));
+      h = vtHashUpdate(h, &scrollTop, sizeof(scrollTop));
+      h = vtHashUpdate(h, &curDir.entrySize, sizeof(curDir.entrySize));
+      h = vtHashUpdate(h, &dirStackPos, sizeof(dirStackPos));
+      // Для видимых строк хэшируем имя, тип и биты флагов.
+      uint16_t top = scrollTop;
+      if (cursor < top) top = cursor;
+      if (cursor >= top + VT_LIST_HEIGHT) top = cursor - VT_LIST_HEIGHT + 1;
+      for (uint8_t r = 0; r < VT_LIST_HEIGHT; r++) {
+        uint16_t i = top + r;
+        if (i >= curDir.entrySize) break;
+        const EntryInfo& e = curDir.entries[i];
+        h = vtHashStr(h, e.name);
+        h = vtHashUpdate(h, &e.type, 1);
+        h = vtHashUpdate(h, &e.mode, 1);
+        h = vtHashUpdate(h, &e.hasValue, 1);
+        if (e.hasValue) h = vtHashUpdate(h, e.value, sizeof(e.value));
+      }
+      break;
+    }
+    case S_EDIT: case S_EDIT_APPLY: {
+      h = vtHashUpdate(h, &editor.entryIdx, sizeof(editor.entryIdx));
+      h = vtHashUpdate(h, &editor.cursor,   sizeof(editor.cursor));
+      h = vtHashUpdate(h, &editor.scrollTop,sizeof(editor.scrollTop));
+      h = vtHashUpdate(h, &editor.count,    sizeof(editor.count));
+      break;
+    }
+  }
+  return h;
+}
+
+void vtFrame() {
+  if (!vtInitDone) {
+    vtInitDone = true;
+    vtCursorOff();
+    vtClear();
+    vtHome();
+    vtLastSig = 0;       // принудить первую перерисовку
+    vtLastState = (AppState)-1;
+  }
+
+  uint32_t sig = vtComputeSignature();
+  if (sig == vtLastSig && appState == vtLastState) return;
+  vtLastSig   = sig;
+  vtLastState = appState;
+
+  switch (appState) {
+    case S_DISCOVER:    vtDrawDiscover();         break;
+    case S_DEVICES:     vtDrawDevices();          break;
+    case S_LOAD_DIR:    vtDrawLoading("loading menu..."); break;
+    case S_BROWSE:      vtDrawBrowse();           break;
+    case S_EDIT:        vtDrawEditor();           break;
+    case S_EDIT_APPLY:  vtDrawLoading("applying..."); break;
+  }
+}
+
 // ====== setup / loop ======
 void setup() {
-  Serial.begin(115200); delay(300);
-  Serial.println("\n=== ESP32 LEVCAN browser v4 ===");
+  // Штатный Serial (UART0, /dev/ttyUSB0) — в будущем пойдёт VT100-интерфейс меню.
+  // Пока выводим туда одну строку-заголовок, чтобы легко было отличить порты.
+  Serial.begin(115200);
+  // Отладочный UART1 на внешнем конвертере: весь существующий лог идёт сюда.
+  Dbg.begin(DBG_UART_BAUD, SERIAL_8N1, DBG_UART_RX, DBG_UART_TX);
+  delay(300);
+  Serial.println("=== UART0 (USB CP210x): будет использован для VT100-меню ===");
+  Dbg.println("\n=== ESP32 LEVCAN browser — debug log on UART1 (GPIO9/10), 115200-N-1 ===");
+  Dbg.printf("Build: %s %s\n", __DATE__, __TIME__);
+  Dbg.printf("DBG UART: num=%d TX=GPIO%d RX=GPIO%d baud=%lu\n",
+             DBG_UART_NUM, DBG_UART_TX, DBG_UART_RX, (unsigned long)DBG_UART_BAUD);
+  Dbg.println("--- если вы видите этот текст — внешний конвертер подключён корректно ---");
   initButtons();
   Wire.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, false, false);
@@ -1414,7 +1840,7 @@ void setup() {
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0); display.println("LEVCAN browser"); display.println("init CAN..."); display.display();
   if (!initCAN()) { display.println("CAN FAIL"); display.display(); while(1) delay(1000); }
-  Serial.printf("Buttons: BACK=%d UP=%d DOWN=%d SEL=%d\n", BTN_BACK, BTN_UP, BTN_DOWN, BTN_SELECT);
+  Dbg.printf("Buttons: BACK=%d UP=%d DOWN=%d SEL=%d\n", BTN_BACK, BTN_UP, BTN_DOWN, BTN_SELECT);
   appState = S_DISCOVER;
   discoverStartMs = millis();
   resetAllChannels();
@@ -1431,6 +1857,8 @@ void runLoopFrame() {
 
 void loop() {
   runLoopFrame();
+  // VT100-клавиатура — всегда в начале итерации, чтобы pollButton() увидел виртуальные нажатия.
+  kbPump();
   uint32_t now = millis();
 
   switch (appState) {
@@ -1449,6 +1877,7 @@ void loop() {
         selectedNode = 0; appState = S_DEVICES;
       }
       drawDiscover();
+      vtFrame();
       break;
     }
     case S_DEVICES: {
@@ -1462,10 +1891,12 @@ void loop() {
       }
       if (pollButton(BI_SEL) && selectedNode >= 0) enterDevice(selectedNode);
       drawDevices();
+      vtFrame();
       break;
     }
     case S_LOAD_DIR: {
       drawLoading("menu...");
+      vtFrame();
       bool ok = loadDir(targetAddr, curDirIndex);
       if (ok) { appState = S_BROWSE; lastLiveUpdMs = now; }
       else    { appState = S_DEVICES; }
@@ -1482,23 +1913,26 @@ void loop() {
         refreshLiveValues(targetAddr, curDirIndex);
       }
       drawBrowse();
+      vtFrame();
       break;
     }
     case S_EDIT: {
       if (pollButton(BI_UP)   && editor.cursor > 0) editor.cursor--;
       if (pollButton(BI_DOWN) && editor.cursor + 1 < editor.count) editor.cursor++;
       if (pollButton(BI_BACK)) {
-        Serial.println("  edit cancelled");
+        Dbg.println("  edit cancelled");
         appState = S_BROWSE;
       } else if (pollButton(BI_SEL)) {
         // Показать "Applying..." и отправить
         drawLoading("applying...");
+        // Для VT100 этот кадр пропустим (применение обычно мгновенное — vtFrame() переведёт экран в S_BROWSE).
         bool ok = applyEditorValue();
         if (ok) drawLoading("applied"); else drawLoading("error");
         delay(400);
         appState = S_BROWSE;
       } else {
         drawEditor();
+        vtFrame();
       }
       break;
     }
