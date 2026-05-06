@@ -155,10 +155,11 @@ uint8_t targetAddr = 0;              // адрес активного устро
 DirInfo curDir;                      // текущая открытая директория
 uint16_t curDirIndex = 0;
 uint8_t  cursor = 0;                 // курсор в меню
-uint8_t  scrollTop = 0;              // верхняя видимая строка
+uint8_t  scrollTop = 0;              // верхняя видимая строка (OLED, 4 строки)
+uint16_t vtScrollTop = 0;            // верхняя видимая строка (VT100, 18 строк) — независимо от OLED
 
 // стек "куда возвращаться по Back"
-struct StackFrame { uint16_t dirIndex; uint8_t cursor; uint8_t scrollTop; };
+struct StackFrame { uint16_t dirIndex; uint8_t cursor; uint8_t scrollTop; uint16_t vtScrollTop; };
 StackFrame dirStack[DEPTH_STACK];
 uint8_t    dirStackPos = 0;
 
@@ -921,7 +922,8 @@ struct {
   int32_t  vmin, vmax, vstep;
   uint16_t count;          // сколько вариантов (1..EDIT_MAX_OPTIONS)
   uint16_t cursor;
-  uint16_t scrollTop;
+  uint16_t scrollTop;       // OLED-окно (4 строки)
+  uint16_t vtScrollTop;     // VT100-окно (18 строк), независимо
   // для Decimal32: Decimals
   uint8_t  decimals;
   // каждый вариант выражается через (vmin + i*vstep) — это лениво вычисляемый список, памяти не храним.
@@ -1204,14 +1206,14 @@ void drawBrowse() {
 // ====== Action handlers ======
 void enterDevice(int nodeIdx) {
   selectedNode = nodeIdx; targetAddr = nodes[nodeIdx].addr;
-  dirStackPos = 0; curDirIndex = 0; cursor = 0; scrollTop = 0;
+  dirStackPos = 0; curDirIndex = 0; cursor = 0; scrollTop = 0; vtScrollTop = 0;
   appState = S_LOAD_DIR;
 }
 void enterFolder(uint16_t newDirIndex) {
   if (dirStackPos < DEPTH_STACK) {
-    dirStack[dirStackPos++] = { curDirIndex, cursor, scrollTop };
+    dirStack[dirStackPos++] = { curDirIndex, cursor, scrollTop, vtScrollTop };
   }
-  curDirIndex = newDirIndex; cursor = 0; scrollTop = 0;
+  curDirIndex = newDirIndex; cursor = 0; scrollTop = 0; vtScrollTop = 0;
   appState = S_LOAD_DIR;
 }
 void goBack() {
@@ -1220,7 +1222,7 @@ void goBack() {
     appState = S_DEVICES; return;
   }
   StackFrame f = dirStack[--dirStackPos];
-  curDirIndex = f.dirIndex; cursor = f.cursor; scrollTop = f.scrollTop;
+  curDirIndex = f.dirIndex; cursor = f.cursor; scrollTop = f.scrollTop; vtScrollTop = f.vtScrollTop;
   appState = S_LOAD_DIR;
 }
 
@@ -1274,6 +1276,7 @@ bool prepareEditor(uint16_t entryIdx) {
   editor.varSize = e.varSize;
   editor.cursor = 0;
   editor.scrollTop = 0;
+  editor.vtScrollTop = 0;
   editor.decimals = 0;
   editor.isSigned = false;
 
@@ -1640,10 +1643,12 @@ static void vtDrawBrowse() {
   vtClearListArea();
   vtDrawHeader(vtCurrentNodeName(), curDir.name);
 
-  // Окно прокрутки: VT_LIST_HEIGHT видимых строк.
-  uint16_t vTop = scrollTop;
-  if (cursor < vTop) vTop = cursor;
-  if (cursor >= vTop + VT_LIST_HEIGHT) vTop = cursor - VT_LIST_HEIGHT + 1;
+  // Окно прокрутки VT100 — независимое, ширина VT_LIST_HEIGHT (18 строк).
+  if (cursor < vtScrollTop) vtScrollTop = cursor;
+  if (cursor >= vtScrollTop + VT_LIST_HEIGHT) vtScrollTop = cursor - VT_LIST_HEIGHT + 1;
+  // Если список короче окна — прижимаем к нулю.
+  if (curDir.entrySize <= VT_LIST_HEIGHT) vtScrollTop = 0;
+  uint16_t vTop = vtScrollTop;
 
   for (uint8_t r = 0; r < VT_LIST_HEIGHT; r++) {
     uint16_t i = vTop + r;
@@ -1708,9 +1713,11 @@ static void vtDrawEditor() {
   const EntryInfo& e = curDir.entries[editor.entryIdx];
   vtDrawHeader(vtCurrentNodeName(), e.name);
 
-  uint16_t vTop = editor.scrollTop;
-  if (editor.cursor < vTop) vTop = editor.cursor;
-  if (editor.cursor >= vTop + VT_LIST_HEIGHT) vTop = editor.cursor - VT_LIST_HEIGHT + 1;
+  // VT100-окно редактора — независимое.
+  if (editor.cursor < editor.vtScrollTop) editor.vtScrollTop = editor.cursor;
+  if (editor.cursor >= editor.vtScrollTop + VT_LIST_HEIGHT) editor.vtScrollTop = editor.cursor - VT_LIST_HEIGHT + 1;
+  if (editor.count <= VT_LIST_HEIGHT) editor.vtScrollTop = 0;
+  uint16_t vTop = editor.vtScrollTop;
 
   for (uint8_t r = 0; r < VT_LIST_HEIGHT; r++) {
     uint16_t i = vTop + r;
@@ -1764,11 +1771,11 @@ static uint32_t vtComputeSignature() {
     case S_BROWSE: {
       h = vtHashStr(h, curDir.name);
       h = vtHashUpdate(h, &cursor, sizeof(cursor));
-      h = vtHashUpdate(h, &scrollTop, sizeof(scrollTop));
+      h = vtHashUpdate(h, &vtScrollTop, sizeof(vtScrollTop));
       h = vtHashUpdate(h, &curDir.entrySize, sizeof(curDir.entrySize));
       h = vtHashUpdate(h, &dirStackPos, sizeof(dirStackPos));
       // Для видимых строк хэшируем имя, тип и биты флагов.
-      uint16_t top = scrollTop;
+      uint16_t top = vtScrollTop;
       if (cursor < top) top = cursor;
       if (cursor >= top + VT_LIST_HEIGHT) top = cursor - VT_LIST_HEIGHT + 1;
       for (uint8_t r = 0; r < VT_LIST_HEIGHT; r++) {
@@ -1786,7 +1793,7 @@ static uint32_t vtComputeSignature() {
     case S_EDIT: case S_EDIT_APPLY: {
       h = vtHashUpdate(h, &editor.entryIdx, sizeof(editor.entryIdx));
       h = vtHashUpdate(h, &editor.cursor,   sizeof(editor.cursor));
-      h = vtHashUpdate(h, &editor.scrollTop,sizeof(editor.scrollTop));
+      h = vtHashUpdate(h, &editor.vtScrollTop,sizeof(editor.vtScrollTop));
       h = vtHashUpdate(h, &editor.count,    sizeof(editor.count));
       break;
     }
