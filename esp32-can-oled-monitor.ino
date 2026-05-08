@@ -769,6 +769,7 @@ bool loadDir(uint8_t target, uint16_t dirIndex) {
     uint16_t nameLen = strlen(e.name);
     bool hasRealText = (e.textSize > nameLen);
     bool needText = hasRealText && (
+        e.type == LCP_Label  ||
         e.type == LCP_Enum   || e.type == LCP_Bool   ||
         e.type == LCP_Int32  || e.type == LCP_Uint32 ||
         e.type == LCP_Int64  || e.type == LCP_Uint64 ||
@@ -1053,6 +1054,13 @@ static bool applyTextFormat(const char* fmt, long ival, const char* sval, char* 
 }
 
 void formatValue(const EntryInfo& e, char* out, size_t outSize) {
+  // Label хранит своё значение в TextData (имя устройства, дата FW и т.п.) —
+  // сервер присылает его через REQ_TEXT, без REQ_VALUE.
+  if (e.type == LCP_Label) {
+    if (e.hasText) snprintf(out, outSize, "%s", e.text);
+    else { out[0] = 0; }
+    return;
+  }
   if (!e.hasValue) { out[0] = '?'; out[1] = 0; return; }
   switch (e.type) {
     case LCP_Bool: {
@@ -1158,7 +1166,7 @@ void drawBrowse() {
 
     // Сначала формируем значение (до 9 символов), имя занимает всё что осталось.
     char val[14] = "";
-    if (e.hasValue) formatValue(e, val, sizeof(val));
+    if (e.hasValue || e.type == LCP_Label) formatValue(e, val, sizeof(val));
     char vs[10];
     {
       size_t L = strlen(val);
@@ -1662,7 +1670,7 @@ static void vtDrawBrowse() {
 
     // Значение — до 16 символов (в терминале места больше).
     char val[32] = "";
-    if (e.hasValue) formatValue(e, val, sizeof(val));
+    if (e.hasValue || e.type == LCP_Label) formatValue(e, val, sizeof(val));
     char vs[18];
     {
       size_t L = strlen(val);
