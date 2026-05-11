@@ -95,7 +95,7 @@ enum LCP_Type {
 
 // ====== Пределы ======
 #define MAX_NODES        8
-#define MAX_ENTRIES_DIR  20
+#define MAX_ENTRIES_DIR  64    // макс. число записей в одной папке (у Thermo Nucular Nastroyka motora = 21, было 20)
 #define NAME_BUF         48
 #define TEXT_BUF         96
 #define DESC_BUF         48  // Decimal32_t=13, Int64_t/Uint64_t=24, запас на будущее
