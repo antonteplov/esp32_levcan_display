@@ -1,6 +1,8 @@
 # ESP32 LEVCAN OLED Monitor
 ## Video
 [<img width="40%"  alt="image" src="https://github.com/user-attachments/assets/acf35afb-6100-4321-a7d6-a5a20b0538ce" />](https://alight.teplov.us/extra/IMG_8717.gif)
+<img width="40%" alt="photo_2026-05-11_23-15-00" src="https://github.com/user-attachments/assets/07dbca05-d0db-4115-a23b-cda926393c02" />
+
 ## Краткое описание и идея
 Взять плату ESP32 с oled дисплеем или внешним дисплеем и подключиться по шине CAN к устройствам использующим протокол [LEVCAN](https://github.com/Nucular-tech/LEVCAN) таким как: 
 
