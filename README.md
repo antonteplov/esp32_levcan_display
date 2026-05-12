@@ -1,6 +1,6 @@
 # ESP32 LEVCAN OLED + VT100 Monitor
 ## Схема 
-<img src=esp32levcan.png />
+![esp32levcan.png](esp32levcan.png)
 
 ## Video
 [<img width="40%"  alt="image" src="https://github.com/user-attachments/assets/acf35afb-6100-4321-a7d6-a5a20b0538ce" />](https://alight.teplov.us/extra/IMG_8717.gif)
